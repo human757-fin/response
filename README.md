@@ -139,7 +139,7 @@ send deleted content after the fact.
 Use a Python 3.12 egg and the supplied startup command:
 
 ```bash
-cd /home/container; if [[ -d .git ]] && [[ "${AUTO_UPDATE}" == "1" ]]; then git pull; fi; if [[ -n "${PY_PACKAGES}" ]]; then /usr/local/bin/python -m pip install --no-cache-dir --upgrade --target /home/container ${PY_PACKAGES}; fi; if [[ -f requirements.txt ]]; then /usr/local/bin/python -m pip install --no-cache-dir --upgrade --target /home/container -r requirements.txt; fi; /usr/local/bin/python webpanel.py & /usr/local/bin/python ${BOT_PY_FILE}
+cd /home/container; mkdir -p /home/container/.pip-tmp; if [[ -d .git ]] && [[ "${AUTO_UPDATE}" == "1" ]]; then git pull; fi; if [[ -n "${PY_PACKAGES}" ]]; then TMPDIR=/home/container/.pip-tmp /usr/local/bin/python -m pip install --no-cache-dir --upgrade --target /home/container ${PY_PACKAGES} || exit 1; fi; if [[ -f requirements.txt ]] && [[ ! -f .requirements-installed || requirements.txt -nt .requirements-installed ]]; then TMPDIR=/home/container/.pip-tmp /usr/local/bin/python -m pip install --no-cache-dir --upgrade --target /home/container -r requirements.txt || exit 1; touch .requirements-installed; fi; /usr/local/bin/python webpanel.py & exec /usr/local/bin/python ${BOT_PY_FILE}
 ```
 
 Configure these Pterodactyl variables:
@@ -172,7 +172,12 @@ appropriate for local development.
 
 The startup line launches `webpanel.py` in the background and keeps `bot.py` as
 the Pterodactyl-managed foreground process. If the bot exits, the server is
-considered stopped and Pterodactyl can restart it.
+considered stopped and Pterodactyl can restart it. Pip stages installations in
+`.pip-tmp` instead of Wings' small `/tmp` mount and records a successful install
+in `.requirements-installed`, avoiding a full reinstall on every restart. Delete
+only that marker when you intentionally need to reinstall unchanged
+requirements. The bot will not start when dependency installation fails, which
+prevents an old or partially installed discord.py build from running.
 
 ### Voice troubleshooting
 
@@ -180,11 +185,13 @@ Discord voice close code `4006` means the voice session is no longer valid.
 Response makes one clean handshake attempt, clears a rejected session, and waits
 30 seconds before accepting another attempt so it cannot repeatedly join and
 leave the channel. Restart the Pterodactyl server after updating so the startup
-command installs the current voice dependencies. If attempts still fail, first
-check that no other process or server is using the same Discord bot token, then
-ask the Pterodactyl node administrator to confirm that the container can make
-outbound UDP connections. Opening only the web-panel and bot health-check
-allocations does not provide Discord voice transport.
+command installs the current voice dependencies. Discord requires DAVE-encrypted
+voice connections, so Response cannot join voice while the runtime still reports
+discord.py 2.5.2. If attempts still fail on discord.py 2.7.1, first check that no
+other process or server is using the same Discord bot token, then ask the
+Pterodactyl node administrator to confirm that the container can make outbound
+UDP connections. Opening only the web-panel and bot health-check allocations
+does not provide Discord voice transport.
 
 ## Automatic restart after a push
 
