@@ -298,6 +298,37 @@ class TicketCloseView(discord.ui.View):
         await interaction.channel.delete(reason=f"Ticket closed by {interaction.user}")
 
 
+def ticket_channel_name(member: discord.Member) -> str:
+    username = re.sub(r"[^a-z0-9_-]+", "-", member.name.lower())
+    username = re.sub(r"-{2,}", "-", username).strip("-_") or "user"
+    return f"ticket-{username}"[:100]
+
+
+def ticket_owner_marker(user_id: int) -> str:
+    return f"response-ticket-owner:{user_id}"
+
+
+async def migrate_legacy_ticket_channels(guild: discord.Guild) -> None:
+    for channel in guild.text_channels:
+        match = re.fullmatch(r"ticket-(\d{16,20})", channel.name)
+        if not match:
+            continue
+        member = guild.get_member(int(match.group(1)))
+        if not member:
+            continue
+        marker = ticket_owner_marker(member.id)
+        old_topic = channel.topic or ""
+        topic = old_topic if marker in old_topic else f"{marker} | @{member.name} | {old_topic}"
+        try:
+            await channel.edit(
+                name=ticket_channel_name(member),
+                topic=topic.strip(" |")[:1024],
+                reason="Migrate Response ticket channel to username naming",
+            )
+        except discord.HTTPException as exc:
+            log.warning("Could not migrate ticket channel %s: %s", channel.id, exc)
+
+
 class TicketPanelView(discord.ui.View):
     def __init__(self) -> None:
         super().__init__(timeout=None)
@@ -312,8 +343,15 @@ class TicketPanelView(discord.ui.View):
         if not interaction.guild or not isinstance(interaction.user, discord.Member):
             return
         cfg = store.get_config(interaction.guild.id)["tickets"]
-        existing = discord.utils.get(
-            interaction.guild.text_channels, name=f"ticket-{interaction.user.id}"
+        expected_name = ticket_channel_name(interaction.user)
+        owner_marker = ticket_owner_marker(interaction.user.id)
+        existing = discord.utils.find(
+            lambda channel: channel.name in {
+                expected_name,
+                f"ticket-{interaction.user.id}",
+            }
+            or owner_marker in (channel.topic or ""),
+            interaction.guild.text_channels,
         )
         if existing:
             return await interaction.response.send_message(
@@ -349,8 +387,9 @@ class TicketPanelView(discord.ui.View):
         await interaction.response.defer(ephemeral=True)
         try:
             channel = await interaction.guild.create_text_channel(
-                f"ticket-{interaction.user.id}",
+                expected_name,
                 category=category,
+                topic=f"{owner_marker} | @{interaction.user.name}",
                 overwrites=overwrites,
                 reason=f"Ticket opened by {interaction.user}",
             )
@@ -626,6 +665,7 @@ async def announce_level(member: discord.Member, level: int, cfg: dict[str, Any]
 async def on_ready() -> None:
     for guild in bot.guilds:
         store.ensure_guild(guild.id, guild.name)
+        await migrate_legacy_ticket_channels(guild)
     log.info("Logged in as %s (%s), serving %s guilds", bot.user, bot.user.id, len(bot.guilds))
 
 

@@ -99,6 +99,7 @@ PAGE = r"""<!doctype html>
     .fields{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;padding:18px}
     label{display:block;color:var(--muted);font-size:12px}.field-name{display:block;margin-bottom:6px;color:#c8ceda}
     textarea{min-height:82px;resize:vertical}.wide{grid-column:1/-1}
+    .config-hint{display:block;margin-top:6px;color:#858ea1;line-height:1.45}.config-hint code{color:#b9c2d3}
     .toggle{display:inline-block;position:relative;width:44px;height:24px;min-width:44px;vertical-align:middle}
     .toggle input{position:absolute;inset:0;z-index:2;width:100%;height:100%;margin:0;padding:0;border:0;
       opacity:0;cursor:pointer;appearance:none;box-shadow:none}
@@ -259,6 +260,13 @@ PAGE = r"""<!doctype html>
     }
     function section(name,obj){return `<div class="section"><div class="section-title"><h2>${pretty(name)}</h2></div><div class="fields">
       ${Object.entries(obj).map(([key,value])=>field([name,key],key,value)).join("")}</div></div>`}
+    function jsonHint(key,value){
+      if(key==="level_roles")return 'Level to role ID. Example: <code>{"5":"ROLE_ID","10":"ROLE_ID"}</code>';
+      if(key==="role_multipliers"||key==="role_boosters")return 'Role ID to bonus. <code>0.5</code> = +50%, <code>1.0</code> = +100%; multiple roles stack.';
+      if(key==="role_entries")return 'Role ID to extra giveaway entries. Example: <code>{"ROLE_ID":2}</code>';
+      if(Array.isArray(value))return 'JSON list of Discord IDs. Example: <code>["ID_1","ID_2"]</code>';
+      return 'Valid JSON uses double quotes around names and text.';
+    }
     function field(path,key,value){
       const p=path.join(".");
       if(typeof value==="boolean")return `<label class="wide"><span class="field-name">${pretty(key)}</span><span class="toggle">
@@ -267,7 +275,8 @@ PAGE = r"""<!doctype html>
       if(snowflake)return `<label><span class="field-name">${pretty(key)} ID</span>
         <input type="text" inputmode="numeric" pattern="[0-9]*" data-path="${p}" data-snowflake="1" value="${esc(value??"")}"></label>`;
       if(value!==null&&typeof value==="object")return `<label class="wide"><span class="field-name">${pretty(key)} (JSON)</span>
-        <textarea data-path="${p}" data-json="1">${esc(JSON.stringify(value,null,2))}</textarea></label>`;
+        <textarea data-path="${p}" data-json="1">${esc(JSON.stringify(value,null,2))}</textarea>
+        <small class="config-hint">${jsonHint(key,value)}</small></label>`;
       const type=typeof value==="number"?"number":"text", step=type==="number"?'step="any"':"";
       const wide=String(value??"").length>48||/(message|background)/.test(key)?"wide":"";
       return `<label class="${wide}"><span class="field-name">${pretty(key)}</span><input type="${type}" ${step} data-path="${p}" value="${esc(value??"")}"></label>`;

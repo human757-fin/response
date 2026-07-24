@@ -40,9 +40,52 @@ under `/sfx`.
 
 For tickets, run `/ticket_panel` and select the destination `category`. Response
 saves that category automatically and always creates new ticket channels inside
-it. Discord IDs entered in the Web UI are stored as strings to avoid JavaScript
-rounding large IDs. If an older category value is invalid, run `/ticket_panel`
-with the category again or repaste the exact category ID in the Web UI.
+it. Ticket names use the account username, not the server display name, while
+the user ID is retained privately in the channel topic for reliable ownership.
+Legacy `ticket-USER_ID` channels are renamed automatically on startup when that
+member is still in the server.
+Discord IDs entered in the Web UI are stored as strings to avoid JavaScript
+rounding large IDs.
+
+## Web UI JSON settings
+
+JSON requires double quotes, no comments, and no trailing comma. Keep Discord
+IDs in quotes:
+
+```json
+["111111111111111111", "222222222222222222"]
+```
+
+Use that list format for channel/role blacklists, trusted users/roles, support
+roles, and allowed voice roles. Use `[]` for an empty list.
+
+Level roles map the required level to the reward role ID:
+
+```json
+{
+  "5": "111111111111111111",
+  "10": "222222222222222222",
+  "25": "333333333333333333"
+}
+```
+
+Response grants every eligible role when the member reaches or exceeds its
+level. The bot needs **Manage Roles**, and its highest role must be above every
+reward role.
+
+Role multipliers map a role ID to an added bonus:
+
+```json
+{
+  "111111111111111111": 0.5,
+  "222222222222222222": 1.0
+}
+```
+
+`0.5` means **+50%** and `1.0` means **+100%**. Bonuses stack: members with both
+example roles receive `1 + 0.5 + 1.0 = 2.5×` XP. The global XP `multiplier` is
+then applied to that result. Economy `role_boosters` use the same format and
+stacking calculation. Use `{}` when no mappings are wanted.
 
 ## Moderation, anti-nuke, and sound effects
 
