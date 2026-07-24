@@ -12,6 +12,7 @@ import os
 import random
 import re
 import shutil
+import sys
 import time
 from collections import defaultdict, deque
 from datetime import timedelta
@@ -480,6 +481,12 @@ class ResponseBot(commands.Bot):
         self.health_runner: web.AppRunner | None = None
 
     async def setup_hook(self) -> None:
+        log.info(
+            "Runtime Python %s, discord.py %s loaded from %s",
+            sys.version.split()[0],
+            discord.__version__,
+            discord.__file__,
+        )
         self.add_view(GiveawayView())
         self.add_view(TicketPanelView())
         self.add_view(TicketCloseView())
@@ -508,6 +515,8 @@ class ResponseBot(commands.Bot):
                     "latency_ms": round(self.latency * 1000),
                     "uptime_seconds": round(time.time() - self.started_at),
                     "database": store.database_backend(),
+                    "python": sys.version.split()[0],
+                    "discord_py": discord.__version__,
                 }
             )
 
