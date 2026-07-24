@@ -139,7 +139,7 @@ send deleted content after the fact.
 Use a Python 3.12 egg and the supplied startup command:
 
 ```bash
-cd /home/container; if [[ -d .git ]] && [[ "${AUTO_UPDATE}" == "1" ]]; then git pull; fi; if [[ -n "${PY_PACKAGES}" ]]; then /usr/local/bin/python -m pip install --upgrade --target /home/container ${PY_PACKAGES}; fi; if [[ -f requirements.txt ]]; then /usr/local/bin/python -m pip install --upgrade --target /home/container -r requirements.txt; fi; /usr/local/bin/python webpanel.py & /usr/local/bin/python ${BOT_PY_FILE}
+cd /home/container; if [[ -d .git ]] && [[ "${AUTO_UPDATE}" == "1" ]]; then git pull; fi; if [[ -n "${PY_PACKAGES}" ]]; then /usr/local/bin/python -m pip install --no-cache-dir --upgrade --target /home/container ${PY_PACKAGES}; fi; if [[ -f requirements.txt ]]; then /usr/local/bin/python -m pip install --no-cache-dir --upgrade --target /home/container -r requirements.txt; fi; /usr/local/bin/python webpanel.py & /usr/local/bin/python ${BOT_PY_FILE}
 ```
 
 Configure these Pterodactyl variables:
