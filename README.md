@@ -38,6 +38,12 @@ Core slash commands include `/rank`, `/profile`, `/work`, `/daily`, `/weekly`,
 Moderation is under `/mod`, voice management is under `/voice`, and saved audio is
 under `/sfx`.
 
+For tickets, run `/ticket_panel` and select the destination `category`. Response
+saves that category automatically and always creates new ticket channels inside
+it. Discord IDs entered in the Web UI are stored as strings to avoid JavaScript
+rounding large IDs. If an older category value is invalid, run `/ticket_panel`
+with the category again or repaste the exact category ID in the Web UI.
+
 ## Moderation, anti-nuke, and sound effects
 
 The web panel has separate **Moderation**, **Anti-nuke**, and **Voice & SFX**

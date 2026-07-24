@@ -319,7 +319,16 @@ class TicketPanelView(discord.ui.View):
             return await interaction.response.send_message(
                 f"You already have {existing.mention}.", ephemeral=True
             )
-        category = interaction.guild.get_channel(int(cfg["category"] or 0))
+        category_id = str(cfg.get("category") or "").strip()
+        category = (
+            interaction.guild.get_channel(int(category_id)) if category_id.isdigit() else None
+        )
+        if not isinstance(category, discord.CategoryChannel):
+            return await interaction.response.send_message(
+                "The ticket category is missing or invalid. Ask an administrator to "
+                "repost the ticket panel with `/ticket_panel category:`.",
+                ephemeral=True,
+            )
         overwrites = {
             interaction.guild.default_role: discord.PermissionOverwrite(view_channel=False),
             interaction.user: discord.PermissionOverwrite(
@@ -328,22 +337,39 @@ class TicketPanelView(discord.ui.View):
             interaction.guild.me: discord.PermissionOverwrite(view_channel=True, manage_channels=True),
         }
         for role_id in cfg["support_roles"]:
-            role = interaction.guild.get_role(int(role_id))
+            role = (
+                interaction.guild.get_role(int(role_id))
+                if str(role_id).isdigit()
+                else None
+            )
             if role:
                 overwrites[role] = discord.PermissionOverwrite(
                     view_channel=True, send_messages=True, read_message_history=True
                 )
-        channel = await interaction.guild.create_text_channel(
-            f"ticket-{interaction.user.id}",
-            category=category if isinstance(category, discord.CategoryChannel) else None,
-            overwrites=overwrites,
-            reason=f"Ticket opened by {interaction.user}",
-        )
+        await interaction.response.defer(ephemeral=True)
+        try:
+            channel = await interaction.guild.create_text_channel(
+                f"ticket-{interaction.user.id}",
+                category=category,
+                overwrites=overwrites,
+                reason=f"Ticket opened by {interaction.user}",
+            )
+        except discord.Forbidden:
+            return await interaction.followup.send(
+                "I cannot create a channel in that category. Put my role above the "
+                "ticket roles and grant Manage Channels.",
+                ephemeral=True,
+            )
+        except discord.HTTPException as exc:
+            return await interaction.followup.send(
+                f"Discord could not create the ticket in that category: {exc}",
+                ephemeral=True,
+            )
         await channel.send(
             f"{interaction.user.mention}\n{cfg['welcome_message']}", view=TicketCloseView()
         )
         store.add_audit(interaction.guild.id, "ticket_opened", channel.name)
-        await interaction.response.send_message(f"Created {channel.mention}.", ephemeral=True)
+        await interaction.followup.send(f"Created {channel.mention}.", ephemeral=True)
 
 
 class ResponseBot(commands.Bot):
@@ -1859,8 +1885,34 @@ async def reaction_role(
 
 
 @bot.tree.command(description="Post the ticket creation panel")
+@app_commands.guild_only()
 @app_commands.checks.has_permissions(manage_channels=True)
-async def ticket_panel(interaction: discord.Interaction) -> None:
+@app_commands.checks.bot_has_permissions(manage_channels=True)
+@app_commands.describe(category="Category where new ticket channels will be created")
+async def ticket_panel(
+    interaction: discord.Interaction,
+    category: discord.CategoryChannel | None = None,
+) -> None:
+    config = store.get_config(interaction.guild_id)
+    tickets = config["tickets"]
+    if category is not None:
+        tickets["category"] = str(category.id)
+        tickets["enabled"] = True
+        store.save_config(interaction.guild_id, config)
+    else:
+        category_id = str(tickets.get("category") or "").strip()
+        configured = (
+            interaction.guild.get_channel(int(category_id))
+            if category_id.isdigit()
+            else None
+        )
+        if not isinstance(configured, discord.CategoryChannel):
+            return await interaction.response.send_message(
+                "Choose a ticket category when running this command. This also fixes "
+                "an invalid category saved in the Web UI.",
+                ephemeral=True,
+            )
+        category = configured
     await interaction.channel.send(
         embed=discord.Embed(
             title="Support & Tickets",
@@ -1869,7 +1921,10 @@ async def ticket_panel(interaction: discord.Interaction) -> None:
         ),
         view=TicketPanelView(),
     )
-    await interaction.response.send_message("Ticket panel posted.", ephemeral=True)
+    await interaction.response.send_message(
+        f"Ticket panel posted. New tickets will go into **{category.name}**.",
+        ephemeral=True,
+    )
 
 
 mod_group = app_commands.Group(name="mod", description="Moderation tools")

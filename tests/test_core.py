@@ -55,6 +55,7 @@ class StoreTests(unittest.TestCase):
         self.assertTrue(config["logs"]["interaction_events"])
         self.assertTrue(config["logs"]["message_create"])
         config["economy"]["currency_name"] = "stars"
+        config["tickets"]["category"] = "1234567890123456789"
         config["custom_section"] = {"value": 7}
 
         saved = self.store.save_config(1, config)
@@ -62,6 +63,7 @@ class StoreTests(unittest.TestCase):
 
         self.assertEqual(saved, loaded)
         self.assertEqual(loaded["economy"]["currency_name"], "stars")
+        self.assertEqual(loaded["tickets"]["category"], "1234567890123456789")
         self.assertEqual(loaded["custom_section"]["value"], 7)
 
     def test_activity_cooldown_and_level_calculation(self) -> None:

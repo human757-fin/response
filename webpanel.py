@@ -263,16 +263,24 @@ PAGE = r"""<!doctype html>
       const p=path.join(".");
       if(typeof value==="boolean")return `<label class="wide"><span class="field-name">${pretty(key)}</span><span class="toggle">
         <input type="checkbox" data-path="${p}" ${value?"checked":""}><i></i></span></label>`;
-      if(typeof value==="object")return `<label class="wide"><span class="field-name">${pretty(key)} (JSON)</span>
+      const snowflake=key==="channel"||key==="category"||key.endsWith("_channel");
+      if(snowflake)return `<label><span class="field-name">${pretty(key)} ID</span>
+        <input type="text" inputmode="numeric" pattern="[0-9]*" data-path="${p}" data-snowflake="1" value="${esc(value??"")}"></label>`;
+      if(value!==null&&typeof value==="object")return `<label class="wide"><span class="field-name">${pretty(key)} (JSON)</span>
         <textarea data-path="${p}" data-json="1">${esc(JSON.stringify(value,null,2))}</textarea></label>`;
       const type=typeof value==="number"?"number":"text", step=type==="number"?'step="any"':"";
       const wide=String(value??"").length>48||/(message|background)/.test(key)?"wide":"";
       return `<label class="${wide}"><span class="field-name">${pretty(key)}</span><input type="${type}" ${step} data-path="${p}" value="${esc(value??"")}"></label>`;
     }
+    function parseConfigJson(text){
+      const safe=text.replace(/([\[,:]\s*)(\d{16,20})(?=\s*[,}\]])/g,'$1"$2"');
+      return JSON.parse(safe);
+    }
     function changeSetting(e){
       const el=e.target,path=el.dataset.path.split(".");let value;
       if(el.type==="checkbox")value=el.checked;
-      else if(el.dataset.json){try{value=JSON.parse(el.value);el.style.borderColor=""}catch{el.style.borderColor="var(--danger)";return}}
+      else if(el.dataset.json){try{value=parseConfigJson(el.value);el.style.borderColor=""}catch{el.style.borderColor="var(--danger)";return}}
+      else if(el.dataset.snowflake)value=el.value.trim()||null;
       else if(el.type==="number")value=Number(el.value);else value=el.value||null;
       let cursor=state.config;for(let i=0;i<path.length-1;i++)cursor=cursor[path[i]];cursor[path.at(-1)]=value;
       state.dirty=true;updateSaveButton();
