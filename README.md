@@ -73,6 +73,11 @@ All logging categories are enabled by default once the main logging switch is on
 - every Discord audit-log action, including its actor, target, reason, and
   available changed fields.
 
+The same stream is saved to MySQL/SQLite and available on the web panel's
+**Event logs** page with full-text search, refresh, and older-event pagination.
+`web_history_limit` controls retention per server, defaults to 10,000 events,
+and is clamped between 100 and 100,000.
+
 Messages posted directly in the configured log channel and Response's own
 messages are excluded to prevent a logging loop. Presence/status changes are not
 collected because Discord requires the separate privileged Presence Intent.

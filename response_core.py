@@ -27,6 +27,7 @@ USE_MYSQL = (
 )
 _MYSQL_CONNECTION: Any = None
 _MYSQL_LOCK = threading.RLock()
+_EVENT_PRUNE_COUNTS: dict[int, int] = {}
 
 
 DEFAULT_CONFIG: dict[str, Any] = {
@@ -114,6 +115,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "thread_events": True,
         "scheduled_event_events": True,
         "audit_log_events": True,
+        "web_history_limit": 10000,
     },
     "tickets": {
         "enabled": False,
@@ -370,6 +372,16 @@ MYSQL_SCHEMA = (
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
     """,
     """
+    CREATE TABLE IF NOT EXISTS event_logs (
+        id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+        guild_id BIGINT UNSIGNED NOT NULL,
+        event_type VARCHAR(191) NOT NULL,
+        detail TEXT NOT NULL,
+        created_at BIGINT NOT NULL,
+        KEY event_logs_guild (guild_id, id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+    """,
+    """
     CREATE TABLE IF NOT EXISTS moderation_cases (
         id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
         guild_id BIGINT UNSIGNED NOT NULL,
@@ -464,6 +476,13 @@ CREATE TABLE IF NOT EXISTS audit_events (
     detail TEXT NOT NULL,
     created_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS event_logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_id INTEGER NOT NULL,
+    event_type TEXT NOT NULL,
+    detail TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS moderation_cases (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     guild_id INTEGER NOT NULL,
@@ -487,6 +506,7 @@ CREATE TABLE IF NOT EXISTS sound_effects (
 );
 CREATE INDEX IF NOT EXISTS members_leaderboard ON members(guild_id, xp DESC);
 CREATE INDEX IF NOT EXISTS schedules_due ON scheduled_messages(enabled, send_at);
+CREATE INDEX IF NOT EXISTS event_logs_guild ON event_logs(guild_id, id);
 CREATE INDEX IF NOT EXISTS cases_user ON moderation_cases(guild_id, user_id);
 """
 
@@ -695,6 +715,64 @@ def add_audit(guild_id: int, event_type: str, detail: str) -> None:
             "INSERT INTO audit_events(guild_id, event_type, detail, created_at) VALUES (?, ?, ?, ?)",
             (guild_id, event_type, detail[:2000], int(time.time())),
         )
+
+
+def add_event_log(
+    guild_id: int,
+    event_type: str,
+    detail: str,
+    history_limit: int = 10000,
+) -> int:
+    retained = min(max(int(history_limit), 100), 100000)
+    with connect() as db:
+        cursor = db.execute(
+            "INSERT INTO event_logs(guild_id, event_type, detail, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            (guild_id, event_type[:191], detail[:4000], int(time.time())),
+        )
+        log_id = int(cursor.lastrowid)
+        prune_count = _EVENT_PRUNE_COUNTS.get(guild_id, 99) + 1
+        if prune_count >= 100:
+            cutoff = db.execute(
+                "SELECT id FROM event_logs WHERE guild_id=? "
+                "ORDER BY id DESC LIMIT 1 OFFSET ?",
+                (guild_id, retained),
+            ).fetchone()
+            if cutoff:
+                db.execute(
+                    "DELETE FROM event_logs WHERE guild_id=? AND id<=?",
+                    (guild_id, cutoff["id"]),
+                )
+            prune_count = 0
+        _EVENT_PRUNE_COUNTS[guild_id] = prune_count
+    return log_id
+
+
+def event_logs(
+    guild_id: int,
+    *,
+    limit: int = 100,
+    before_id: int | None = None,
+    search: str = "",
+) -> list[dict[str, Any]]:
+    query = (
+        "SELECT id, event_type, detail, created_at FROM event_logs "
+        "WHERE guild_id=?"
+    )
+    parameters: tuple[Any, ...] = (guild_id,)
+    if before_id is not None:
+        query += " AND id<?"
+        parameters += (before_id,)
+    search = search.strip()[:200]
+    if search:
+        pattern = f"%{search}%"
+        query += " AND (event_type LIKE ? OR detail LIKE ?)"
+        parameters += (pattern, pattern)
+    query += " ORDER BY id DESC LIMIT ?"
+    parameters += (min(max(int(limit), 1), 500),)
+    with connect() as db:
+        rows = db.execute(query, parameters).fetchall()
+    return [dict(row) for row in rows]
 
 
 def dashboard_data(guild_id: int) -> dict[str, Any]:

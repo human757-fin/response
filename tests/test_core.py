@@ -36,6 +36,7 @@ class StoreTests(unittest.TestCase):
             for table in (
                 "sound_effects",
                 "moderation_cases",
+                "event_logs",
                 "giveaway_entries",
                 "giveaways",
                 "scheduled_messages",
@@ -135,6 +136,29 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(deleted["source_type"], "url")
         self.assertEqual(self.store.list_sound_effects(1), [])
 
+    def test_event_logs_support_search_and_cursor_pagination(self) -> None:
+        first = self.store.add_event_log(1, "Member joined", "Alpha joined")
+        second = self.store.add_event_log(1, "Voice state updated", "Beta joined General")
+        third = self.store.add_event_log(1, "Message edited", "Gamma changed a message")
+
+        newest = self.store.event_logs(1, limit=2)
+        self.assertEqual([row["id"] for row in newest], [third, second])
+        older = self.store.event_logs(1, limit=2, before_id=second)
+        self.assertEqual([row["id"] for row in older], [first])
+        searched = self.store.event_logs(1, search="general")
+        self.assertEqual([row["event_type"] for row in searched], ["Voice state updated"])
+
+    def test_event_log_retention_prunes_old_history(self) -> None:
+        first_id = 0
+        for index in range(250):
+            log_id = self.store.add_event_log(2, "Message sent", f"message {index}", 100)
+            if index == 0:
+                first_id = log_id
+
+        retained = self.store.event_logs(2, limit=500)
+        self.assertLessEqual(len(retained), 199)
+        self.assertGreater(min(row["id"] for row in retained), first_id)
+
     def test_giveaway_schema_keeps_weighted_entries(self) -> None:
         with self.store.connect() as db:
             db.execute(
@@ -192,6 +216,7 @@ class StoreTests(unittest.TestCase):
         schema = "\n".join(self.store.MYSQL_SCHEMA)
         self.assertIn("AUTO_INCREMENT", schema)
         self.assertIn("ENGINE=InnoDB", schema)
+        self.assertIn("event_logs_guild", schema)
         self.assertNotIn("AUTOINCREMENT", schema)
 
 

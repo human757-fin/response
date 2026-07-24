@@ -67,6 +67,7 @@
   -configurable thresholds, time window, trusted users, trusted roles and response
   -complete event logging for message changes, voice activity, interactions, members, threads and scheduled events
   -full Discord audit-log feed with actor, target, reason and changed fields
+  -persistent searchable web UI event history with pagination and configurable retention
 
 ## Voice and SFX
   -join, leave and stop controls

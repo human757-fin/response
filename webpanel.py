@@ -116,6 +116,10 @@ PAGE = r"""<!doctype html>
     .toolbar{display:flex;gap:10px;align-items:end;margin-bottom:16px;flex-wrap:wrap}.toolbar label{flex:1;min-width:150px}
     .settings+.card{margin-top:16px}.source-pill{display:inline-block;padding:2px 7px;border-radius:99px;background:#252b39;
       color:#b8c0d0;font-size:11px;text-transform:uppercase}
+    .log-list{display:grid;gap:10px}.log-entry{padding:14px;border:1px solid var(--line);border-radius:11px;background:#11151d}
+    .log-head{display:flex;justify-content:space-between;gap:16px;align-items:center;margin-bottom:8px}
+    .log-head small{color:var(--muted);white-space:nowrap}.log-detail{white-space:pre-wrap;overflow-wrap:anywhere;color:#c8ceda}
+    .load-more{display:block;margin:16px auto 0}
     @media(max-width:1000px){.grid{grid-template-columns:repeat(2,1fr)}.settings{grid-template-columns:1fr}}
     @media(max-width:720px){aside{position:static;width:auto;height:auto;border-right:0;border-bottom:1px solid var(--line)}
       aside nav{display:flex;overflow:auto}.nav-section,.server-select{display:none}nav button{white-space:nowrap;width:auto}
@@ -144,6 +148,7 @@ PAGE = r"""<!doctype html>
         <div class="nav-section">Management</div>
         <button data-page="welcome">☻ &nbsp; Welcome & boost</button>
         <button data-page="moderation">⌁ &nbsp; Moderation</button>
+        <button data-page="eventlogs">≡ &nbsp; Event logs</button>
         <button data-page="antinuke">⚿ &nbsp; Anti-nuke</button>
         <button data-page="sfx">♫ &nbsp; Voice & SFX</button>
         <button data-page="messages">▤ &nbsp; Messages</button>
@@ -158,7 +163,7 @@ PAGE = r"""<!doctype html>
     <div class="actions"><div class="toast" id="toast"></div><button class="primary" id="save" style="display:none">Save changes</button></div>
   </div>
   <script>
-    const state={guilds:[],guild:null,config:null,page:"dashboard",dirty:false};
+    const state={guilds:[],guild:null,config:null,page:"dashboard",dirty:false,eventLogs:[],logSearch:"",logHasMore:false};
     const $=s=>document.querySelector(s), esc=s=>String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
     async function api(path,options={}) {
       const response=await fetch(path,{headers:{"Content-Type":"application/json",...(options.headers||{})},...options});
@@ -193,7 +198,7 @@ PAGE = r"""<!doctype html>
         state.dirty=false;updateSaveButton();toast("Settings saved")}catch(e){toast(e.message,true)}
       finally{button.disabled=false}});
     function title(){return {dashboard:"Overview",leveling:"Leveling",economy:"Economy",giveaways:"Giveaways",welcome:"Welcome & boost",
-      moderation:"Moderation",antinuke:"Anti-nuke",sfx:"Voice & sound effects",messages:"Scheduled messages"}[state.page]}
+      moderation:"Moderation",eventlogs:"Event logs",antinuke:"Anti-nuke",sfx:"Voice & sound effects",messages:"Scheduled messages"}[state.page]}
     async function render(){
       $("#pageTitle").textContent=title();$("#serverName").textContent=state.guild?.name||"No server selected";
       updateSaveButton();
@@ -201,6 +206,7 @@ PAGE = r"""<!doctype html>
       if(state.page==="giveaways")return renderGiveaways();
       if(state.page==="messages")return renderMessages();
       if(state.page==="moderation")return renderModeration();
+      if(state.page==="eventlogs")return renderEventLogs();
       if(state.page==="sfx")return renderSfx();
       renderSettings(pageMap[state.page]||[]);
     }
@@ -212,6 +218,30 @@ PAGE = r"""<!doctype html>
       </div><div class="split"><div class="card"><h2>XP leaderboard</h2>${leaderboard(d.leaderboard)}</div>
       <div class="card"><h2>Recent activity</h2>${d.events.length?d.events.map(x=>`<div class="event"><b>${esc(x.event_type.replaceAll("_"," "))}</b>
         <div>${esc(x.detail)}</div><small>${new Date(x.created_at*1000).toLocaleString()}</small></div>`).join(""):'<div class="empty">No activity logged yet.</div>'}</div></div>`;
+    }
+    async function renderEventLogs(){state.logSearch="";await loadEventLogs(true)}
+    async function loadEventLogs(reset){
+      const params=new URLSearchParams({limit:"100"});
+      if(state.logSearch)params.set("search",state.logSearch);
+      if(!reset&&state.eventLogs.length)params.set("before",state.eventLogs.at(-1).id);
+      try{
+        const d=await api(`/api/guilds/${state.guild.guild_id}/event-logs?${params}`);
+        state.eventLogs=reset?d.logs:state.eventLogs.concat(d.logs);state.logHasMore=d.has_more;drawEventLogs();
+      }catch(error){toast(error.message,true)}
+    }
+    function drawEventLogs(){
+      $("#content").innerHTML=`<div class="card"><div class="settings-head"><div><h2>Persistent server event history</h2>
+        <div class="muted">${state.eventLogs.length} event(s) loaded</div></div><button id="logRefresh">Refresh</button></div>
+        <form id="logSearchForm" class="toolbar"><label><span class="field-name">Search event names and details</span>
+          <input id="logSearch" value="${esc(state.logSearch)}" placeholder="member, voice, channel ID…"></label>
+          <button class="primary">Search</button></form>
+        <div class="log-list">${state.eventLogs.length?state.eventLogs.map(item=>`<article class="log-entry">
+          <div class="log-head"><b>${esc(item.event_type)}</b><small>#${item.id} · ${new Date(item.created_at*1000).toLocaleString()}</small></div>
+          <div class="log-detail">${esc(item.detail)}</div></article>`).join(""):'<div class="empty">No matching events have been recorded yet.</div>'}</div>
+        ${state.logHasMore?'<button class="load-more" id="logMore">Load older events</button>':""}</div>`;
+      $("#logSearchForm").addEventListener("submit",event=>{event.preventDefault();state.logSearch=$("#logSearch").value.trim();loadEventLogs(true)});
+      $("#logRefresh").addEventListener("click",()=>loadEventLogs(true));
+      $("#logMore")?.addEventListener("click",()=>loadEventLogs(false));
     }
     function metric(name,value){return `<div class="metric"><span>${name}</span><strong>${value}</strong></div>`}
     function leaderboard(rows){return rows.length?`<table><thead><tr><th>#</th><th>Member</th><th>Level</th><th>XP</th></tr></thead><tbody>
@@ -382,6 +412,17 @@ def guild_id(request: web.Request) -> int:
         raise web.HTTPBadRequest(text="Invalid guild ID") from exc
 
 
+def record_panel_event(target: int, event_type: str, detail: str) -> None:
+    config = store.get_config(target)["logs"]
+    if not config["enabled"]:
+        return
+    try:
+        retention = int(config.get("web_history_limit", 10000))
+    except (TypeError, ValueError):
+        retention = 10000
+    store.add_event_log(target, event_type, detail, retention)
+
+
 async def config_get(request: web.Request) -> web.Response:
     return json_response({"config": store.get_config(guild_id(request))})
 
@@ -395,6 +436,11 @@ async def config_put(request: web.Request) -> web.Response:
         return json_response({"error": "Configuration must be an object"}, 400)
     saved = store.save_config(guild_id(request), config)
     store.add_audit(guild_id(request), "settings_updated", "Configuration changed in web panel")
+    record_panel_event(
+        guild_id(request),
+        "Web panel settings saved",
+        "The server configuration was changed by an authenticated web panel session.",
+    )
     return json_response({"config": saved})
 
 
@@ -404,6 +450,24 @@ async def dashboard(request: web.Request) -> web.Response:
 
 async def moderation_cases(request: web.Request) -> web.Response:
     return json_response({"cases": store.moderation_cases(guild_id(request), limit=200)})
+
+
+async def event_logs(request: web.Request) -> web.Response:
+    try:
+        limit = min(max(int(request.query.get("limit", "100")), 1), 250)
+        before_value = request.query.get("before", "")
+        before_id = int(before_value) if before_value else None
+    except ValueError:
+        return json_response({"error": "Invalid event-log pagination values"}, 400)
+    if before_id is not None and before_id < 1:
+        return json_response({"error": "Invalid event-log cursor"}, 400)
+    rows = store.event_logs(
+        guild_id(request),
+        limit=limit + 1,
+        before_id=before_id,
+        search=request.query.get("search", ""),
+    )
+    return json_response({"logs": rows[:limit], "has_more": len(rows) > limit})
 
 
 def remove_sound_file(sound: dict[str, Any] | None) -> None:
@@ -490,6 +554,11 @@ async def sound_effect_create(request: web.Request) -> web.Response:
         if previous and previous.get("source") != source:
             remove_sound_file(previous)
         store.add_audit(target, "sfx_saved", f"Saved sound effect: {name}")
+        record_panel_event(
+            target,
+            "Web panel sound effect saved",
+            f"Sound effect `{name}` was saved from a {source_type} source.",
+        )
         return json_response({"ok": True, "name": name}, 201)
     except ValueError as exc:
         if uploaded_path:
@@ -503,14 +572,20 @@ async def sound_effect_create(request: web.Request) -> web.Response:
 
 
 async def sound_effect_delete(request: web.Request) -> web.Response:
+    target = guild_id(request)
     try:
         sound_id = int(request.match_info["sound_id"])
     except ValueError:
         return json_response({"error": "Invalid sound-effect ID"}, 400)
-    sound = store.delete_sound_effect(guild_id(request), sound_id)
+    sound = store.delete_sound_effect(target, sound_id)
     if not sound:
         return json_response({"error": "Sound effect not found"}, 404)
     remove_sound_file(sound)
+    record_panel_event(
+        target,
+        "Web panel sound effect deleted",
+        f"Sound-effect record `{sound_id}` was deleted.",
+    )
     return json_response({"ok": True})
 
 
@@ -559,12 +634,13 @@ async def schedule_create(request: web.Request) -> web.Response:
         return json_response({"error": "Channel, message, and delay are required"}, 400)
     if not content or minutes < 1 or repeat_minutes < 0:
         return json_response({"error": "Invalid schedule values"}, 400)
+    target = guild_id(request)
     with store.connect() as db:
         cursor = db.execute(
             "INSERT INTO scheduled_messages(guild_id, channel_id, content, send_at, repeat_seconds) "
             "VALUES (?, ?, ?, ?, ?)",
             (
-                guild_id(request),
+                target,
                 channel_id,
                 content[:2000],
                 int(time.time()) + minutes * 60,
@@ -572,6 +648,11 @@ async def schedule_create(request: web.Request) -> web.Response:
             ),
         )
         schedule_id = cursor.lastrowid
+    record_panel_event(
+        target,
+        "Web panel message scheduled",
+        f"Scheduled message `{schedule_id}` for channel `{channel_id}` in {minutes} minute(s).",
+    )
     return json_response({"ok": True, "id": schedule_id}, 201)
 
 
@@ -581,9 +662,19 @@ async def schedule_delete(request: web.Request) -> web.Response:
     except ValueError:
         return json_response({"error": "Invalid schedule ID"}, 400)
     with store.connect() as db:
+        row = db.execute(
+            "SELECT guild_id FROM scheduled_messages WHERE id=?", (schedule_id,)
+        ).fetchone()
+        if not row:
+            return json_response({"error": "Schedule not found"}, 404)
         cursor = db.execute("DELETE FROM scheduled_messages WHERE id=?", (schedule_id,))
     if not cursor.rowcount:
         return json_response({"error": "Schedule not found"}, 404)
+    record_panel_event(
+        int(row["guild_id"]),
+        "Web panel schedule deleted",
+        f"Scheduled message `{schedule_id}` was deleted.",
+    )
     return json_response({"ok": True})
 
 
@@ -596,6 +687,7 @@ def create_app() -> web.Application:
     app.router.add_get("/api/guilds/{guild_id}/config", config_get)
     app.router.add_put("/api/guilds/{guild_id}/config", config_put)
     app.router.add_get("/api/guilds/{guild_id}/dashboard", dashboard)
+    app.router.add_get("/api/guilds/{guild_id}/event-logs", event_logs)
     app.router.add_get("/api/guilds/{guild_id}/moderation-cases", moderation_cases)
     app.router.add_get("/api/guilds/{guild_id}/sfx", sound_effects)
     app.router.add_post("/api/guilds/{guild_id}/sfx", sound_effect_create)

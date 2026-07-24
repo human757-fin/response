@@ -544,6 +544,14 @@ async def send_log(guild: discord.Guild, title: str, description: str) -> None:
     cfg = store.get_config(guild.id)["logs"]
     if not cfg["enabled"]:
         return
+    try:
+        history_limit = int(cfg.get("web_history_limit", 10000))
+    except (TypeError, ValueError):
+        history_limit = 10000
+    try:
+        store.add_event_log(guild.id, title, description, history_limit)
+    except Exception as exc:
+        log.warning("Could not save event log in guild %s: %s", guild.id, exc)
     if not cfg["channel"]:
         return
     try:
@@ -1855,8 +1863,8 @@ async def reaction_role(
 async def ticket_panel(interaction: discord.Interaction) -> None:
     await interaction.channel.send(
         embed=discord.Embed(
-            title="Support tickets",
-            description="Click below to create a private support channel.",
+            title="Support & Tickets",
+            description="Want to join the clan, have a clan war or partnership? Click the button below to open a private support ticket with our staff!",
             color=discord.Color.green(),
         ),
         view=TicketPanelView(),
