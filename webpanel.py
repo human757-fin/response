@@ -92,10 +92,16 @@ PAGE = r"""<!doctype html>
     .fields{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;padding:18px}
     label{display:block;color:var(--muted);font-size:12px}.field-name{display:block;margin-bottom:6px;color:#c8ceda}
     textarea{min-height:82px;resize:vertical}.wide{grid-column:1/-1}
-    .toggle{position:relative;width:42px;height:24px}.toggle input{opacity:0;width:0;height:0}
-    .toggle i{position:absolute;inset:0;background:#303644;border-radius:99px;transition:.2s}
-    .toggle i:after{content:"";position:absolute;width:18px;height:18px;left:3px;top:3px;background:#fff;border-radius:50%;transition:.2s}
-    .toggle input:checked+i{background:var(--accent)}.toggle input:checked+i:after{transform:translateX(18px)}
+    .toggle{display:inline-block;position:relative;width:44px;height:24px;min-width:44px;vertical-align:middle}
+    .toggle input{position:absolute;inset:0;z-index:2;width:100%;height:100%;margin:0;padding:0;border:0;
+      opacity:0;cursor:pointer;appearance:none;box-shadow:none}
+    .toggle i{position:absolute;inset:0;display:block;background:#303644;border:1px solid #404858;border-radius:999px;
+      box-shadow:inset 0 1px 2px rgba(0,0,0,.3);transition:background .2s ease,border-color .2s ease,box-shadow .2s ease}
+    .toggle i:after{content:"";position:absolute;width:18px;height:18px;left:2px;top:2px;background:#f7f8fb;border-radius:50%;
+      box-shadow:0 2px 5px rgba(0,0,0,.38);transition:transform .2s ease}
+    .toggle input:checked+i{background:var(--accent);border-color:var(--accent)}
+    .toggle input:checked+i:after{transform:translateX(20px)}
+    .toggle input:focus-visible+i{box-shadow:0 0 0 3px #7c6cff42,inset 0 1px 2px rgba(0,0,0,.25)}
     .actions{position:fixed;z-index:4;bottom:22px;right:28px;display:flex;align-items:center;gap:12px}
     .toast{opacity:0;transform:translateY(8px);transition:.2s;padding:10px 14px;background:#1c2530;border:1px solid #314052;
       border-radius:9px;box-shadow:var(--shadow);pointer-events:none}.toast.show{opacity:1;transform:none}
