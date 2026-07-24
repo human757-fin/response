@@ -1,0 +1,12 @@
+instructions.txt
+.env
+.env.*
+!.env.example
+__pycache__/
+*.py[cod]
+*.db
+*.db-shm
+*.db-wal
+.pytest_cache/
+.ruff_cache/
+.venv/
