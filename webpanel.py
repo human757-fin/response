@@ -185,15 +185,18 @@ PAGE = r"""<!doctype html>
     $("#guild").addEventListener("change",async e=>{state.guild=state.guilds.find(g=>String(g.guild_id)===e.target.value);await loadConfig();render()});
     document.querySelectorAll("nav button").forEach(b=>b.addEventListener("click",()=>{state.page=b.dataset.page;
       document.querySelectorAll("nav button").forEach(x=>x.classList.toggle("active",x===b));render()}));
-    $("#save").addEventListener("click",async()=>{try{await api(`/api/guilds/${state.guild.guild_id}/config`,{method:"PUT",body:JSON.stringify(state.config)});
-      state.dirty=false;$("#save").style.display="none";toast("Settings saved")}catch(e){toast(e.message,true)}});
     const pageMap={leveling:["leveling"],economy:["economy"],welcome:["welcome","boost"],
       moderation:["logs","tickets","moderation"],antinuke:["antinuke"],sfx:["voice"]};
+    function updateSaveButton(){$("#save").style.display=state.dirty&&pageMap[state.page]?"block":"none"}
+    $("#save").addEventListener("click",async()=>{const button=$("#save");button.disabled=true;
+      try{await api(`/api/guilds/${state.guild.guild_id}/config`,{method:"PUT",body:JSON.stringify(state.config)});
+        state.dirty=false;updateSaveButton();toast("Settings saved")}catch(e){toast(e.message,true)}
+      finally{button.disabled=false}});
     function title(){return {dashboard:"Overview",leveling:"Leveling",economy:"Economy",giveaways:"Giveaways",welcome:"Welcome & boost",
       moderation:"Moderation",antinuke:"Anti-nuke",sfx:"Voice & sound effects",messages:"Scheduled messages"}[state.page]}
     async function render(){
       $("#pageTitle").textContent=title();$("#serverName").textContent=state.guild?.name||"No server selected";
-      $("#save").style.display=pageMap[state.page]?"block":"none";
+      updateSaveButton();
       if(state.page==="dashboard")return renderDashboard();
       if(state.page==="giveaways")return renderGiveaways();
       if(state.page==="messages")return renderMessages();
@@ -242,7 +245,7 @@ PAGE = r"""<!doctype html>
       else if(el.dataset.json){try{value=JSON.parse(el.value);el.style.borderColor=""}catch{el.style.borderColor="var(--danger)";return}}
       else if(el.type==="number")value=Number(el.value);else value=el.value||null;
       let cursor=state.config;for(let i=0;i<path.length-1;i++)cursor=cursor[path[i]];cursor[path.at(-1)]=value;
-      state.dirty=true;
+      state.dirty=true;updateSaveButton();
     }
     async function renderGiveaways(){
       const d=await api(`/api/guilds/${state.guild.guild_id}/giveaways`);
