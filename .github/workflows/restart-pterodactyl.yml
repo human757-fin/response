@@ -35,7 +35,7 @@ jobs:
         run: |
           python -m py_compile bot.py webpanel.py response_core.py response_cards.py
           python -m unittest discover -s tests -v
-          python -c "import bot; names={command.name for command in bot.bot.tree.get_commands()}; assert {'mod','voice','sfx'} <= names; assert len(names) == 18"
+          python -c "import bot; names={command.name for command in bot.bot.tree.get_commands()}; assert {'mod','voice','sfx'} <= names; assert len(names) == 18; assert all(hasattr(bot.bot, event) for event in ('on_audit_log_entry_create','on_voice_state_update','on_raw_message_edit','on_raw_bulk_message_delete','on_interaction'))"
 
   restart:
     name: Restart server (startup auto-pulls)

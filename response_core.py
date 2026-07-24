@@ -101,10 +101,12 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "logs": {
         "enabled": False,
         "channel": None,
+        "message_create": True,
         "message_delete": True,
         "message_edit": True,
         "bulk_message_delete": True,
         "reaction_events": True,
+        "interaction_events": True,
         "member_events": True,
         "member_updates": True,
         "voice_events": True,

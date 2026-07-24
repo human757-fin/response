@@ -65,6 +65,8 @@
   -moderation cases in the web UI and optional Discord case log channel
   -rapid channel, role, kick and ban detection using Discord audit logs
   -configurable thresholds, time window, trusted users, trusted roles and response
+  -complete event logging for message changes, voice activity, interactions, members, threads and scheduled events
+  -full Discord audit-log feed with actor, target, reason and changed fields
 
 ## Voice and SFX
   -join, leave and stop controls

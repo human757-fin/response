@@ -544,11 +544,14 @@ async def send_log(guild: discord.Guild, title: str, description: str) -> None:
     cfg = store.get_config(guild.id)["logs"]
     if not cfg["enabled"]:
         return
-    event_type = "discord_" + re.sub(r"[^a-z0-9]+", "_", title.lower()).strip("_")
-    store.add_audit(guild.id, event_type[:100], description[:2000])
     if not cfg["channel"]:
         return
-    channel = guild.get_channel_or_thread(int(cfg["channel"]))
+    try:
+        channel_id = int(cfg["channel"])
+    except (TypeError, ValueError):
+        log.warning("Invalid logging channel configured in guild %s", guild.id)
+        return
+    channel = guild.get_channel_or_thread(channel_id)
     if isinstance(channel, (discord.TextChannel, discord.Thread)):
         try:
             await channel.send(
@@ -604,8 +607,9 @@ async def on_audit_log_entry_create(entry: discord.AuditLogEntry) -> None:
         return
     actor = display_object(entry.user) if entry.user else "Unknown actor"
     target = display_object(entry.target)
+    action_name = entry.action.name.replace("_", " ").title()
     details = (
-        f"**Action:** {entry.action.name.replace('_', ' ').title()}\n"
+        f"**Action:** {action_name}\n"
         f"**Actor:** {actor}\n"
         f"**Target:** {target}\n"
         f"**Reason:** {entry.reason or 'No reason provided'}"
@@ -615,7 +619,27 @@ async def on_audit_log_entry_create(entry: discord.AuditLogEntry) -> None:
         details += f"\n\n{changes}"
     if entry.extra:
         details += f"\n**Extra:** {display_object(entry.extra)}"
-    await send_log(guild, "Discord audit log entry", details)
+    await send_log(guild, f"Audit · {action_name}", details)
+
+
+@bot.event
+async def on_interaction(interaction: discord.Interaction) -> None:
+    if (
+        not interaction.guild
+        or interaction.type is discord.InteractionType.autocomplete
+        or not logging_enabled(interaction.guild, "interaction_events")
+    ):
+        return
+    data = interaction.data if isinstance(interaction.data, dict) else {}
+    name = data.get("name") or data.get("custom_id") or "Unknown interaction"
+    await send_log(
+        interaction.guild,
+        "Interaction used",
+        f"**Type:** {interaction.type.name.replace('_', ' ').title()}\n"
+        f"**Name:** `{str(name)[:200]}`\n"
+        f"**Member:** {display_object(interaction.user)}\n"
+        f"**Channel:** {display_object(interaction.channel)}",
+    )
 
 
 @bot.event
@@ -644,9 +668,33 @@ async def on_guild_role_delete(role: discord.Role) -> None:
 
 @bot.event
 async def on_message(message: discord.Message) -> None:
-    if message.author.bot or not message.guild or not isinstance(message.author, discord.Member):
+    if not message.guild:
         return
     cfg = store.get_config(message.guild.id)
+    log_config = cfg["logs"]
+    configured_log_channel = (
+        int(log_config["channel"])
+        if str(log_config.get("channel") or "").isdigit()
+        else 0
+    )
+    if (
+        log_config["enabled"]
+        and log_config.get("message_create", True)
+        and message.author.id != getattr(bot.user, "id", 0)
+        and message.channel.id != configured_log_channel
+    ):
+        attachments = ", ".join(item.url for item in message.attachments) or "None"
+        await send_log(
+            message.guild,
+            "Message sent",
+            f"**Author:** {message.author.mention} (`{message.author.id}`)\n"
+            f"**Channel:** {message.channel.mention}\n"
+            f"**Message:** [Jump to message]({message.jump_url}) (`{message.id}`)\n"
+            f"**Content:** {(message.content or '*No text*')[:2500]}\n"
+            f"**Attachments:** {attachments[:700]}",
+        )
+    if message.author.bot or not isinstance(message.author, discord.Member):
+        return
     leveling, economy = cfg["leveling"], cfg["economy"]
     xp = money = 0.0
     cooldown = int(leveling["message_cooldown"])
@@ -867,16 +915,34 @@ async def on_message_delete(message: discord.Message) -> None:
 @bot.event
 async def on_message_edit(before: discord.Message, after: discord.Message) -> None:
     if before.guild and (
-        before.content != after.content or before.attachments != after.attachments
+        before.content != after.content
+        or before.attachments != after.attachments
+        or before.embeds != after.embeds
+        or before.components != after.components
+        or before.pinned != after.pinned
     ):
         if logging_enabled(before.guild, "message_edit"):
+            metadata_changes: list[str] = []
+            if before.attachments != after.attachments:
+                metadata_changes.append("attachments")
+            if before.embeds != after.embeds:
+                metadata_changes.append("embeds")
+            if before.components != after.components:
+                metadata_changes.append("components")
+            if before.pinned != after.pinned:
+                metadata_changes.append("pin state")
+            metadata = (
+                f"\n**Other changes:** {', '.join(metadata_changes)}"
+                if metadata_changes
+                else ""
+            )
             await send_log(
                 before.guild,
                 "Message edited",
                 f"**Author:** {before.author.mention}\n**Channel:** {before.channel.mention}\n"
                 f"**Message:** [Jump to message]({after.jump_url}) (`{after.id}`)\n"
                 f"**Before:** {(before.content or '*No text*')[:1600]}\n"
-                f"**After:** {(after.content or '*No text*')[:1600]}",
+                f"**After:** {(after.content or '*No text*')[:1600]}{metadata}",
             )
 
 
@@ -965,6 +1031,273 @@ async def on_member_update(before: discord.Member, after: discord.Member) -> Non
                     ),
                     file=card,
                 )
+    if not logging_enabled(after.guild, "member_updates"):
+        return
+    changes: list[str] = []
+    if before.nick != after.nick:
+        changes.append(f"**Nickname:** {before.nick or 'None'} → {after.nick or 'None'}")
+    before_roles = {role.id: role for role in before.roles[1:]}
+    after_roles = {role.id: role for role in after.roles[1:]}
+    added_roles = [role.mention for role_id, role in after_roles.items() if role_id not in before_roles]
+    removed_roles = [
+        role.mention for role_id, role in before_roles.items() if role_id not in after_roles
+    ]
+    if added_roles:
+        changes.append(f"**Roles added:** {', '.join(added_roles)}")
+    if removed_roles:
+        changes.append(f"**Roles removed:** {', '.join(removed_roles)}")
+    if before.timed_out_until != after.timed_out_until:
+        timeout = (
+            f"<t:{int(after.timed_out_until.timestamp())}:F>"
+            if after.timed_out_until
+            else "Removed"
+        )
+        changes.append(f"**Timeout:** {timeout}")
+    if before.pending != after.pending:
+        changes.append(f"**Membership screening pending:** {after.pending}")
+    if before.premium_since != after.premium_since:
+        changes.append(
+            "**Server boost:** "
+            + ("Started" if after.premium_since is not None else "Ended")
+        )
+    if before.guild_avatar != after.guild_avatar:
+        changes.append("**Server profile avatar:** Changed")
+    if changes:
+        await send_log(
+            after.guild,
+            "Member updated",
+            f"**Member:** {after.mention} (`{after.id}`)\n" + "\n".join(changes),
+        )
+
+
+@bot.event
+async def on_user_update(before: discord.User, after: discord.User) -> None:
+    changes: list[str] = []
+    if before.name != after.name:
+        changes.append(f"**Username:** {before.name} → {after.name}")
+    if before.global_name != after.global_name:
+        changes.append(
+            f"**Display name:** {before.global_name or 'None'} → {after.global_name or 'None'}"
+        )
+    if before.avatar != after.avatar:
+        changes.append("**Avatar:** Changed")
+    if not changes:
+        return
+    for guild in bot.guilds:
+        if guild.get_member(after.id) and logging_enabled(guild, "member_updates"):
+            await send_log(
+                guild,
+                "User profile updated",
+                f"**User:** {after.mention} (`{after.id}`)\n" + "\n".join(changes),
+            )
+
+
+@bot.event
+async def on_automod_action(execution: discord.AutoModAction) -> None:
+    if not logging_enabled(execution.guild, "moderation"):
+        return
+    member = execution.member
+    await send_log(
+        execution.guild,
+        "AutoMod action executed",
+        f"**Member:** {display_object(member) if member else f'<@{execution.user_id}>'}\n"
+        f"**Rule ID:** `{execution.rule_id}`\n"
+        f"**Channel:** {display_object(execution.channel)}\n"
+        f"**Matched keyword:** {execution.matched_keyword or 'Not supplied'}\n"
+        f"**Matched content:** {(execution.matched_content or 'Not supplied')[:1000]}\n"
+        f"**Message content:** {(execution.content or 'Not supplied')[:1000]}",
+    )
+
+
+@bot.event
+async def on_voice_state_update(
+    member: discord.Member, before: discord.VoiceState, after: discord.VoiceState
+) -> None:
+    if not logging_enabled(member.guild, "voice_events"):
+        return
+    changes: list[str] = []
+    if before.channel != after.channel:
+        if before.channel is None and after.channel is not None:
+            changes.append(f"**Joined:** {after.channel.mention}")
+        elif before.channel is not None and after.channel is None:
+            changes.append(f"**Left:** {before.channel.mention}")
+        else:
+            changes.append(
+                f"**Moved:** {before.channel.mention} → {after.channel.mention}"
+            )
+    state_names = {
+        "mute": "Server mute",
+        "deaf": "Server deafen",
+        "self_mute": "Self mute",
+        "self_deaf": "Self deafen",
+        "self_stream": "Streaming",
+        "self_video": "Camera",
+        "suppress": "Stage suppressed",
+    }
+    for attribute, label in state_names.items():
+        old_value = getattr(before, attribute, None)
+        new_value = getattr(after, attribute, None)
+        if old_value != new_value:
+            changes.append(f"**{label}:** {'Enabled' if new_value else 'Disabled'}")
+    if before.requested_to_speak_at != after.requested_to_speak_at:
+        changes.append(
+            "**Stage request to speak:** "
+            + ("Requested" if after.requested_to_speak_at else "Cleared")
+        )
+    if changes:
+        await send_log(
+            member.guild,
+            "Voice state updated",
+            f"**Member:** {member.mention} (`{member.id}`)\n" + "\n".join(changes),
+        )
+
+
+@bot.event
+async def on_thread_create(thread: discord.Thread) -> None:
+    if logging_enabled(thread.guild, "thread_events"):
+        await send_log(
+            thread.guild,
+            "Thread created",
+            f"**Thread:** {thread.mention} (`{thread.id}`)\n"
+            f"**Parent:** {display_object(thread.parent)}\n"
+            f"**Owner:** <@{thread.owner_id}>",
+        )
+
+
+@bot.event
+async def on_thread_delete(thread: discord.Thread) -> None:
+    if logging_enabled(thread.guild, "thread_events"):
+        await send_log(
+            thread.guild,
+            "Thread deleted",
+            f"**Thread:** {thread.name} (`{thread.id}`)\n"
+            f"**Parent:** {display_object(thread.parent)}",
+        )
+
+
+@bot.event
+async def on_thread_update(before: discord.Thread, after: discord.Thread) -> None:
+    if not logging_enabled(after.guild, "thread_events"):
+        return
+    changes: list[str] = []
+    for attribute, label in (
+        ("name", "Name"),
+        ("archived", "Archived"),
+        ("locked", "Locked"),
+        ("slowmode_delay", "Slowmode"),
+        ("auto_archive_duration", "Auto archive"),
+    ):
+        old_value = getattr(before, attribute)
+        new_value = getattr(after, attribute)
+        if old_value != new_value:
+            changes.append(f"**{label}:** {old_value} → {new_value}")
+    if changes:
+        await send_log(
+            after.guild,
+            "Thread updated",
+            f"**Thread:** {after.mention} (`{after.id}`)\n" + "\n".join(changes),
+        )
+
+
+@bot.event
+async def on_thread_member_join(member: discord.ThreadMember) -> None:
+    thread = member.thread
+    if logging_enabled(thread.guild, "thread_events"):
+        await send_log(
+            thread.guild,
+            "Thread member joined",
+            f"**Member:** <@{member.id}> (`{member.id}`)\n"
+            f"**Thread:** {thread.mention} (`{thread.id}`)",
+        )
+
+
+@bot.event
+async def on_thread_member_remove(member: discord.ThreadMember) -> None:
+    thread = member.thread
+    if logging_enabled(thread.guild, "thread_events"):
+        await send_log(
+            thread.guild,
+            "Thread member left",
+            f"**Member:** <@{member.id}> (`{member.id}`)\n"
+            f"**Thread:** {thread.mention} (`{thread.id}`)",
+        )
+
+
+@bot.event
+async def on_scheduled_event_create(event: discord.ScheduledEvent) -> None:
+    if logging_enabled(event.guild, "scheduled_event_events"):
+        await send_log(
+            event.guild,
+            "Server event created",
+            f"**Event:** {event.name} (`{event.id}`)\n"
+            f"**Starts:** <t:{int(event.start_time.timestamp())}:F>\n"
+            f"**Channel:** {display_object(event.channel)}",
+        )
+
+
+@bot.event
+async def on_scheduled_event_update(
+    before: discord.ScheduledEvent, after: discord.ScheduledEvent
+) -> None:
+    if not logging_enabled(after.guild, "scheduled_event_events"):
+        return
+    changes: list[str] = []
+    for attribute, label in (
+        ("name", "Name"),
+        ("status", "Status"),
+        ("start_time", "Start time"),
+        ("end_time", "End time"),
+        ("channel_id", "Channel ID"),
+        ("location", "Location"),
+    ):
+        old_value = getattr(before, attribute, None)
+        new_value = getattr(after, attribute, None)
+        if old_value != new_value:
+            changes.append(
+                f"**{label}:** {display_object(old_value)} → {display_object(new_value)}"
+            )
+    if changes:
+        await send_log(
+            after.guild,
+            "Server event updated",
+            f"**Event:** {after.name} (`{after.id}`)\n" + "\n".join(changes),
+        )
+
+
+@bot.event
+async def on_scheduled_event_delete(event: discord.ScheduledEvent) -> None:
+    if logging_enabled(event.guild, "scheduled_event_events"):
+        await send_log(
+            event.guild,
+            "Server event deleted",
+            f"**Event:** {event.name} (`{event.id}`)",
+        )
+
+
+@bot.event
+async def on_scheduled_event_user_add(
+    event: discord.ScheduledEvent, user: discord.User
+) -> None:
+    if logging_enabled(event.guild, "scheduled_event_events"):
+        await send_log(
+            event.guild,
+            "Server event RSVP added",
+            f"**User:** {user.mention} (`{user.id}`)\n"
+            f"**Event:** {event.name} (`{event.id}`)",
+        )
+
+
+@bot.event
+async def on_scheduled_event_user_remove(
+    event: discord.ScheduledEvent, user: discord.User
+) -> None:
+    if logging_enabled(event.guild, "scheduled_event_events"):
+        await send_log(
+            event.guild,
+            "Server event RSVP removed",
+            f"**User:** {user.mention} (`{user.id}`)\n"
+            f"**Event:** {event.name} (`{event.id}`)",
+        )
 
 
 @tasks.loop(minutes=1)

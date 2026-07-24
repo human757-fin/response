@@ -61,6 +61,24 @@ permissions needed by its selected response, and its highest role must be above
 roles/members it needs to control. Voice playback installs PyNaCl and a bundled
 FFmpeg binary from `requirements.txt`, so the standard Python 3.12 egg can run it.
 
+## Event logging
+
+Enable logging and set the log channel ID on the web panel's **Moderation** page.
+All logging categories are enabled by default once the main logging switch is on:
+
+- new messages, cached and uncached edits/deletions, bulk deletion, and reactions;
+- member joins/leaves, bans/unbans, role/nickname/timeout/profile changes;
+- voice joins, leaves, moves, mute/deafen, camera, streaming, and stage changes;
+- slash commands, buttons, select menus, threads, server events, and AutoMod;
+- every Discord audit-log action, including its actor, target, reason, and
+  available changed fields.
+
+Messages posted directly in the configured log channel and Response's own
+messages are excluded to prevent a logging loop. Presence/status changes are not
+collected because Discord requires the separate privileged Presence Intent.
+Uncached deleted messages can only include their IDs because Discord does not
+send deleted content after the fact.
+
 ## Pterodactyl deployment
 
 Use a Python 3.12 egg and the supplied startup command:

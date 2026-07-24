@@ -49,6 +49,10 @@ class StoreTests(unittest.TestCase):
     def test_default_config_is_populated_and_preserved(self) -> None:
         config = self.store.ensure_guild(1, "Test server")
         self.assertTrue(config["leveling"]["enabled"])
+        self.assertTrue(config["logs"]["voice_events"])
+        self.assertTrue(config["logs"]["audit_log_events"])
+        self.assertTrue(config["logs"]["interaction_events"])
+        self.assertTrue(config["logs"]["message_create"])
         config["economy"]["currency_name"] = "stars"
         config["custom_section"] = {"value": 7}
 
