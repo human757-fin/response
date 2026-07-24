@@ -2,8 +2,9 @@
 
 Response is a Discord engagement and management bot with a standalone web panel. It
 supports leveling, economy, reaction roles, welcome/goodbye and boost messages,
-event logs, private tickets, embeds, scheduled messages, and persistent weighted
-giveaways.
+event logs, private tickets, moderation cases, configurable anti-nuke protection,
+voice utilities, a saved sound-effect library, embeds, scheduled messages, and
+persistent weighted giveaways.
 
 ## Services
 
@@ -23,8 +24,10 @@ balances, and scheduled messages survive restarts.
 2. Enable **Server Members Intent** and **Message Content Intent** under the bot's
    privileged gateway intents.
 3. Invite it with the `bot` and `applications.commands` scopes. Grant the bot the
-   permissions required by the features you enable (manage roles/channels, read
-   and send messages, embed links, and add reactions).
+   permissions required by the features you enable (manage roles/channels,
+   messages, members, timeouts, kicks and bans; view audit log; connect and speak;
+   move, mute and deafen members; read/send messages; embed links; and add
+   reactions).
 4. Set `DISCORD_TOKEN` in Pterodactyl. Never commit a real token.
 5. Start the server. Global slash commands may take a while to appear. During
    development, set `DEV_GUILD_ID` to sync commands immediately to one server.
@@ -32,6 +35,31 @@ balances, and scheduled messages survive restarts.
 Core slash commands include `/rank`, `/profile`, `/work`, `/daily`, `/weekly`,
 `/coinflip`, `/xp-leaderboard`, `/embed`, `/edit-embed`, `/schedule`,
 `/schedule-embed`, `/giveaway`, `/reroll`, `/reaction_role`, and `/ticket_panel`.
+Moderation is under `/mod`, voice management is under `/voice`, and saved audio is
+under `/sfx`.
+
+## Moderation, anti-nuke, and sound effects
+
+The web panel has separate **Moderation**, **Anti-nuke**, and **Voice & SFX**
+pages. Discord role and channel IDs can be copied with Discord Developer Mode
+enabled.
+
+- Moderation commands support warnings, warning history, timeouts, kicks, bans,
+  purges, and channel locks. Every member action creates a database-backed case.
+- Anti-nuke protection watches rapid channel creation/deletion, role
+  creation/deletion, kicks, and bans through Discord's audit log. Add trusted
+  user and role IDs before enabling it. `action` accepts `remove_roles`,
+  `timeout`, `kick`, or `ban`; `*_limit` values are measured inside
+  `window_seconds`.
+- The SFX library accepts MP3, WAV, OGG, M4A, WebM, and FLAC uploads or HTTP(S)
+  audio links. `/sfx play` joins the command user's voice channel and streams the
+  saved sound. Uploads are stored in `data/sfx/` and are intentionally excluded
+  from Git.
+
+Anti-nuke is disabled by default. The bot needs **View Audit Log** plus any
+permissions needed by its selected response, and its highest role must be above
+roles/members it needs to control. Voice playback installs PyNaCl and a bundled
+FFmpeg binary from `requirements.txt`, so the standard Python 3.12 egg can run it.
 
 ## Pterodactyl deployment
 
@@ -115,4 +143,3 @@ http://127.0.0.1:2067/health
 ```
 
 Run the tests with `python -m unittest discover -s tests -v`.
-

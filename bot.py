@@ -10,8 +10,12 @@ import json
 import logging
 import os
 import random
+import re
+import shutil
 import time
+from collections import defaultdict, deque
 from datetime import timedelta
+from pathlib import Path
 from typing import Any
 
 import aiohttp
@@ -32,6 +36,8 @@ log = logging.getLogger("response")
 TOKEN = os.getenv("DISCORD_TOKEN", "")
 BOT_PORT = int(os.getenv("BOT_PORT", "2067"))
 DEV_GUILD_ID = int(os.getenv("DEV_GUILD_ID", "0") or 0)
+SFX_ROOT = store.ROOT / "data" / "sfx"
+SFX_ROOT.mkdir(parents=True, exist_ok=True)
 
 intents = discord.Intents.default()
 intents.members = True
@@ -58,6 +64,126 @@ def color(value: str, fallback: int = 0x5865F2) -> discord.Color:
 
 def format_duration(seconds: int) -> str:
     return str(timedelta(seconds=max(0, seconds))).split(".")[0]
+
+
+def parse_duration(value: str) -> int | None:
+    match = re.fullmatch(r"\s*(\d+)\s*([smhdw])\s*", value.lower())
+    if not match:
+        return None
+    amount = int(match.group(1))
+    multiplier = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}[match.group(2)]
+    return amount * multiplier
+
+
+def ffmpeg_executable() -> str | None:
+    system_ffmpeg = shutil.which("ffmpeg")
+    if system_ffmpeg:
+        return system_ffmpeg
+    try:
+        import imageio_ffmpeg
+
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except (ImportError, RuntimeError, OSError):
+        return None
+
+
+def can_target(moderator: discord.Member, target: discord.Member) -> bool:
+    return (
+        target != moderator
+        and target != target.guild.owner
+        and (moderator == target.guild.owner or moderator.top_role > target.top_role)
+        and target.guild.me is not None
+        and target.guild.me.top_role > target.top_role
+    )
+
+
+async def notify_moderation_target(
+    member: discord.Member, action: str, reason: str, duration: str | None = None
+) -> None:
+    if not store.get_config(member.guild.id)["moderation"]["dm_on_action"]:
+        return
+    detail = f"You were **{action}** in **{member.guild.name}**.\nReason: {reason}"
+    if duration:
+        detail += f"\nDuration: {duration}"
+    try:
+        await member.send(embed=discord.Embed(title="Moderation action", description=detail))
+    except discord.HTTPException:
+        pass
+
+
+def moderation_reason(guild_id: int, reason: str) -> str:
+    configured = store.get_config(guild_id)["moderation"]["default_reason"]
+    return (reason.strip() or str(configured).strip() or "No reason provided")[:1000]
+
+
+async def record_moderation(
+    guild: discord.Guild,
+    user_id: int,
+    moderator_id: int,
+    action: str,
+    reason: str,
+    expires_at: int | None = None,
+) -> int:
+    case_id = store.add_moderation_case(
+        guild.id, user_id, moderator_id, action, reason, expires_at
+    )
+    cfg = store.get_config(guild.id)["moderation"]
+    channel = guild.get_channel(int(cfg["case_log_channel"] or 0))
+    if isinstance(channel, discord.TextChannel):
+        await channel.send(
+            embed=discord.Embed(
+                title=f"Case #{case_id} · {action}",
+                description=(
+                    f"**User:** <@{user_id}> (`{user_id}`)\n"
+                    f"**Moderator:** <@{moderator_id}>\n**Reason:** {reason}"
+                ),
+                color=discord.Color.orange(),
+                timestamp=discord.utils.utcnow(),
+            )
+        )
+    return case_id
+
+
+def voice_allowed(member: discord.Member, config: dict[str, Any]) -> bool:
+    if member.guild_permissions.manage_guild or member.guild_permissions.administrator:
+        return True
+    allowed = {int(value) for value in config["allowed_roles"] if str(value).isdigit()}
+    return bool(config["allow_everyone"] or any(role.id in allowed for role in member.roles))
+
+
+async def ephemeral(interaction: discord.Interaction, message: str) -> None:
+    if interaction.response.is_done():
+        await interaction.followup.send(message, ephemeral=True)
+    else:
+        await interaction.response.send_message(message, ephemeral=True)
+
+
+async def get_voice_client(
+    interaction: discord.Interaction, *, connect: bool = True
+) -> discord.VoiceClient | None:
+    if not interaction.guild or not isinstance(interaction.user, discord.Member):
+        await ephemeral(interaction, "This only works in a server.")
+        return None
+    config = store.get_config(interaction.guild.id)["voice"]
+    if not config["enabled"] or not voice_allowed(interaction.user, config):
+        await ephemeral(interaction, "You are not allowed to use Response voice controls.")
+        return None
+    client = interaction.guild.voice_client
+    if not connect:
+        return client
+    channel = interaction.user.voice.channel if interaction.user.voice else None
+    if not isinstance(channel, (discord.VoiceChannel, discord.StageChannel)):
+        await ephemeral(interaction, "Join a voice channel first.")
+        return None
+    if client and client.channel != channel:
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=True)
+        await client.move_to(channel)
+    elif not client:
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=True)
+        client = await channel.connect(self_deaf=True)
+    return client
 
 
 async def download_image(url: str | None) -> bytes | None:
@@ -272,22 +398,170 @@ class ResponseBot(commands.Bot):
 
 
 bot = ResponseBot()
+antinuke_events: dict[tuple[int, int, str], deque[float]] = defaultdict(deque)
+antinuke_seen: dict[int, deque[int]] = defaultdict(lambda: deque(maxlen=250))
+sfx_cooldowns: dict[tuple[int, int], float] = {}
+
+
+async def audit_actor(
+    guild: discord.Guild, action: discord.AuditLogAction, target_id: int
+) -> discord.Member | None:
+    await asyncio.sleep(0.8)
+    try:
+        async for entry in guild.audit_logs(limit=8, action=action):
+            if entry.id in antinuke_seen[guild.id]:
+                continue
+            if getattr(entry.target, "id", None) != target_id:
+                continue
+            if (discord.utils.utcnow() - entry.created_at).total_seconds() > 20:
+                continue
+            antinuke_seen[guild.id].append(entry.id)
+            return guild.get_member(entry.user.id) if entry.user else None
+    except discord.Forbidden:
+        log.warning("Anti-nuke needs View Audit Log in guild %s", guild.id)
+    return None
+
+
+async def antinuke_event(
+    guild: discord.Guild,
+    event_name: str,
+    audit_action: discord.AuditLogAction,
+    target_id: int,
+) -> None:
+    config = store.get_config(guild.id)["antinuke"]
+    if not config["enabled"]:
+        return
+    limit = int(config.get(f"{event_name}_limit", 0))
+    if limit <= 0:
+        return
+    actor = await audit_actor(guild, audit_action, target_id)
+    if not actor or actor.id in {guild.owner_id, getattr(bot.user, "id", 0)}:
+        return
+    trusted_users = {int(value) for value in config["trusted_users"] if str(value).isdigit()}
+    trusted_roles = {int(value) for value in config["trusted_roles"] if str(value).isdigit()}
+    if actor.id in trusted_users or any(role.id in trusted_roles for role in actor.roles):
+        return
+
+    now = time.monotonic()
+    bucket = antinuke_events[(guild.id, actor.id, event_name)]
+    window = max(3, int(config["window_seconds"]))
+    while bucket and now - bucket[0] > window:
+        bucket.popleft()
+    bucket.append(now)
+    if len(bucket) < limit:
+        return
+    bucket.clear()
+
+    response = str(config["action"])
+    reason = f"Anti-nuke: {event_name.replace('_', ' ')} threshold reached"
+    try:
+        if response == "ban":
+            await actor.ban(reason=reason, delete_message_seconds=0)
+        elif response == "kick":
+            await actor.kick(reason=reason)
+        elif response == "timeout":
+            await actor.timeout(
+                timedelta(minutes=max(1, int(config["timeout_minutes"]))), reason=reason
+            )
+        else:
+            dangerous = [
+                role
+                for role in actor.roles
+                if not role.is_default()
+                and not role.managed
+                and role < guild.me.top_role
+                and (
+                    role.permissions.administrator
+                    or role.permissions.manage_guild
+                    or role.permissions.manage_channels
+                    or role.permissions.manage_roles
+                    or role.permissions.manage_webhooks
+                    or role.permissions.ban_members
+                    or role.permissions.kick_members
+                )
+            ]
+            if dangerous:
+                await actor.remove_roles(*dangerous, reason=reason)
+            response = "remove_roles"
+    except discord.Forbidden:
+        response += " (failed: role hierarchy or missing permission)"
+
+    await record_moderation(
+        guild,
+        actor.id,
+        getattr(bot.user, "id", 0),
+        "anti_nuke",
+        f"{reason}; response={response}",
+    )
+    channel = guild.get_channel(int(config["log_channel"] or 0))
+    if isinstance(channel, discord.TextChannel):
+        await channel.send(
+            embed=discord.Embed(
+                title="Anti-nuke triggered",
+                description=(
+                    f"**Actor:** {actor.mention} (`{actor.id}`)\n"
+                    f"**Event:** {event_name.replace('_', ' ')}\n"
+                    f"**Response:** {response}"
+                ),
+                color=discord.Color.red(),
+                timestamp=discord.utils.utcnow(),
+            )
+        )
+
+
+def logging_enabled(guild: discord.Guild, event: str) -> bool:
+    config = store.get_config(guild.id)["logs"]
+    return bool(config["enabled"] and config.get(event, True))
+
+
+def display_object(value: Any) -> str:
+    if value is None:
+        return "None"
+    mention = getattr(value, "mention", None)
+    object_id = getattr(value, "id", None)
+    if mention and object_id:
+        return f"{mention} (`{object_id}`)"
+    text = str(value).replace("\n", " ")
+    return text[:300] + ("…" if len(text) > 300 else "")
+
+
+def audit_change_summary(entry: discord.AuditLogEntry) -> str:
+    changes: list[str] = []
+    for key, after_value in entry.after:
+        before_value = getattr(entry.before, key, None)
+        if str(before_value) == str(after_value):
+            continue
+        changes.append(
+            f"**{key.replace('_', ' ').title()}:** "
+            f"{display_object(before_value)} → {display_object(after_value)}"
+        )
+        if len(changes) == 8:
+            break
+    return "\n".join(changes)
 
 
 async def send_log(guild: discord.Guild, title: str, description: str) -> None:
     cfg = store.get_config(guild.id)["logs"]
-    if not cfg["enabled"] or not cfg["channel"]:
+    if not cfg["enabled"]:
         return
-    channel = guild.get_channel(int(cfg["channel"]))
-    if isinstance(channel, discord.TextChannel):
-        await channel.send(
-            embed=discord.Embed(
-                title=title,
-                description=description[:4000],
-                color=discord.Color.orange(),
-                timestamp=discord.utils.utcnow(),
+    event_type = "discord_" + re.sub(r"[^a-z0-9]+", "_", title.lower()).strip("_")
+    store.add_audit(guild.id, event_type[:100], description[:2000])
+    if not cfg["channel"]:
+        return
+    channel = guild.get_channel_or_thread(int(cfg["channel"]))
+    if isinstance(channel, (discord.TextChannel, discord.Thread)):
+        try:
+            await channel.send(
+                embed=discord.Embed(
+                    title=title,
+                    description=description[:4000] or "*No details available.*",
+                    color=discord.Color.orange(),
+                    timestamp=discord.utils.utcnow(),
+                ),
+                allowed_mentions=discord.AllowedMentions.none(),
             )
-        )
+        except discord.HTTPException as exc:
+            log.warning("Could not send event log in guild %s: %s", guild.id, exc)
 
 
 async def reward_level_roles(member: discord.Member, level: int, mapping: dict[str, Any]) -> None:
@@ -321,6 +595,51 @@ async def on_ready() -> None:
 @bot.event
 async def on_guild_join(guild: discord.Guild) -> None:
     store.ensure_guild(guild.id, guild.name)
+
+
+@bot.event
+async def on_audit_log_entry_create(entry: discord.AuditLogEntry) -> None:
+    guild = entry.guild
+    if not logging_enabled(guild, "audit_log_events"):
+        return
+    actor = display_object(entry.user) if entry.user else "Unknown actor"
+    target = display_object(entry.target)
+    details = (
+        f"**Action:** {entry.action.name.replace('_', ' ').title()}\n"
+        f"**Actor:** {actor}\n"
+        f"**Target:** {target}\n"
+        f"**Reason:** {entry.reason or 'No reason provided'}"
+    )
+    changes = audit_change_summary(entry)
+    if changes:
+        details += f"\n\n{changes}"
+    if entry.extra:
+        details += f"\n**Extra:** {display_object(entry.extra)}"
+    await send_log(guild, "Discord audit log entry", details)
+
+
+@bot.event
+async def on_guild_channel_create(channel: discord.abc.GuildChannel) -> None:
+    await antinuke_event(
+        channel.guild, "channel_create", discord.AuditLogAction.channel_create, channel.id
+    )
+
+
+@bot.event
+async def on_guild_channel_delete(channel: discord.abc.GuildChannel) -> None:
+    await antinuke_event(
+        channel.guild, "channel_delete", discord.AuditLogAction.channel_delete, channel.id
+    )
+
+
+@bot.event
+async def on_guild_role_create(role: discord.Role) -> None:
+    await antinuke_event(role.guild, "role_create", discord.AuditLogAction.role_create, role.id)
+
+
+@bot.event
+async def on_guild_role_delete(role: discord.Role) -> None:
+    await antinuke_event(role.guild, "role_delete", discord.AuditLogAction.role_delete, role.id)
 
 
 @bot.event
@@ -363,10 +682,22 @@ async def on_message(message: discord.Message) -> None:
 
 @bot.event
 async def on_raw_reaction_add(payload: discord.RawReactionActionEvent) -> None:
-    if not payload.guild_id or payload.user_id == getattr(bot.user, "id", None):
+    if not payload.guild_id:
         return
     guild = bot.get_guild(payload.guild_id)
     if not guild:
+        return
+    if logging_enabled(guild, "reaction_events"):
+        channel = guild.get_channel_or_thread(payload.channel_id)
+        await send_log(
+            guild,
+            "Reaction added",
+            f"**Member:** <@{payload.user_id}> (`{payload.user_id}`)\n"
+            f"**Reaction:** {payload.emoji}\n"
+            f"**Channel:** {display_object(channel)}\n"
+            f"**Message ID:** `{payload.message_id}`",
+        )
+    if payload.user_id == getattr(bot.user, "id", None):
         return
     member = payload.member or guild.get_member(payload.user_id)
     if not member or member.bot:
@@ -403,6 +734,16 @@ async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent) -> Non
     guild = bot.get_guild(payload.guild_id)
     if not guild:
         return
+    if logging_enabled(guild, "reaction_events"):
+        channel = guild.get_channel_or_thread(payload.channel_id)
+        await send_log(
+            guild,
+            "Reaction removed",
+            f"**Member:** <@{payload.user_id}> (`{payload.user_id}`)\n"
+            f"**Reaction:** {payload.emoji}\n"
+            f"**Channel:** {display_object(channel)}\n"
+            f"**Message ID:** `{payload.message_id}`",
+        )
     with store.connect() as db:
         row = db.execute(
             "SELECT role_id FROM reaction_roles WHERE guild_id=? AND message_id=? AND emoji=?",
@@ -441,8 +782,14 @@ async def on_member_join(member: discord.Member) -> None:
                 ),
                 file=card,
             )
-    if store.get_config(member.guild.id)["logs"]["member_events"]:
-        await send_log(member.guild, "Member joined", f"{member.mention} (`{member.id}`)")
+    if logging_enabled(member.guild, "member_events"):
+        await send_log(
+            member.guild,
+            "Member joined",
+            f"**Member:** {member.mention} (`{member.id}`)\n"
+            f"**Account created:** <t:{int(member.created_at.timestamp())}:F>\n"
+            f"**Member count:** {member.guild.member_count}",
+        )
 
 
 @bot.event
@@ -474,8 +821,16 @@ async def on_member_remove(member: discord.Member) -> None:
             )
     if cfg["leveling"]["reset_on_leave"]:
         store.delete_member(member.guild.id, member.id)
-    if cfg["logs"]["member_events"]:
-        await send_log(member.guild, "Member left", f"{member} (`{member.id}`)")
+    if logging_enabled(member.guild, "member_events"):
+        roles = ", ".join(role.mention for role in member.roles[1:]) or "None"
+        await send_log(
+            member.guild,
+            "Member left",
+            f"**Member:** {member} (`{member.id}`)\n"
+            f"**Joined:** {f'<t:{int(member.joined_at.timestamp())}:F>' if member.joined_at else 'Unknown'}\n"
+            f"**Roles:** {roles}",
+        )
+    await antinuke_event(member.guild, "kick", discord.AuditLogAction.kick, member.id)
 
 
 @bot.event
@@ -483,34 +838,107 @@ async def on_member_ban(guild: discord.Guild, user: discord.User) -> None:
     cfg = store.get_config(guild.id)
     if cfg["leveling"]["reset_on_ban"]:
         store.delete_member(guild.id, user.id)
-    if cfg["logs"]["moderation"]:
+    if logging_enabled(guild, "moderation"):
         await send_log(guild, "Member banned", f"{user} (`{user.id}`)")
+    await antinuke_event(guild, "ban", discord.AuditLogAction.ban, user.id)
+
+
+@bot.event
+async def on_member_unban(guild: discord.Guild, user: discord.User) -> None:
+    if logging_enabled(guild, "moderation"):
+        await send_log(guild, "Member unbanned", f"{user} (`{user.id}`)")
 
 
 @bot.event
 async def on_message_delete(message: discord.Message) -> None:
-    if message.guild and not message.author.bot:
-        cfg = store.get_config(message.guild.id)["logs"]
-        if cfg["message_delete"]:
+    if message.guild:
+        if logging_enabled(message.guild, "message_delete"):
+            attachments = ", ".join(item.filename for item in message.attachments) or "None"
             await send_log(
                 message.guild,
                 "Message deleted",
                 f"**Author:** {message.author.mention}\n**Channel:** {message.channel.mention}\n"
-                f"**Content:** {message.content or '*No text*'}",
+                f"**Message ID:** `{message.id}`\n"
+                f"**Content:** {(message.content or '*No text*')[:2500]}\n"
+                f"**Attachments:** {attachments[:500]}",
             )
 
 
 @bot.event
 async def on_message_edit(before: discord.Message, after: discord.Message) -> None:
-    if before.guild and before.content != after.content and not before.author.bot:
-        cfg = store.get_config(before.guild.id)["logs"]
-        if cfg["message_edit"]:
+    if before.guild and (
+        before.content != after.content or before.attachments != after.attachments
+    ):
+        if logging_enabled(before.guild, "message_edit"):
             await send_log(
                 before.guild,
                 "Message edited",
                 f"**Author:** {before.author.mention}\n**Channel:** {before.channel.mention}\n"
-                f"**Before:** {before.content}\n**After:** {after.content}",
+                f"**Message:** [Jump to message]({after.jump_url}) (`{after.id}`)\n"
+                f"**Before:** {(before.content or '*No text*')[:1600]}\n"
+                f"**After:** {(after.content or '*No text*')[:1600]}",
             )
+
+
+@bot.event
+async def on_raw_message_delete(payload: discord.RawMessageDeleteEvent) -> None:
+    if not payload.guild_id or payload.cached_message is not None:
+        return
+    guild = bot.get_guild(payload.guild_id)
+    if not guild or not logging_enabled(guild, "message_delete"):
+        return
+    channel = guild.get_channel_or_thread(payload.channel_id)
+    await send_log(
+        guild,
+        "Uncached message deleted",
+        f"**Channel:** {display_object(channel)}\n"
+        f"**Message ID:** `{payload.message_id}`\n"
+        "**Content:** Unavailable because the message was not in the bot cache.",
+    )
+
+
+@bot.event
+async def on_raw_bulk_message_delete(payload: discord.RawBulkMessageDeleteEvent) -> None:
+    if not payload.guild_id:
+        return
+    guild = bot.get_guild(payload.guild_id)
+    if not guild or not logging_enabled(guild, "bulk_message_delete"):
+        return
+    channel = guild.get_channel_or_thread(payload.channel_id)
+    ids = ", ".join(str(message_id) for message_id in list(payload.message_ids)[:50])
+    await send_log(
+        guild,
+        "Messages bulk deleted",
+        f"**Channel:** {display_object(channel)}\n"
+        f"**Count:** {len(payload.message_ids)}\n"
+        f"**Message IDs:** `{ids}`",
+    )
+
+
+@bot.event
+async def on_raw_message_edit(payload: discord.RawMessageUpdateEvent) -> None:
+    if not payload.guild_id or payload.cached_message is not None:
+        return
+    guild = bot.get_guild(payload.guild_id)
+    if not guild or not logging_enabled(guild, "message_edit"):
+        return
+    channel = guild.get_channel_or_thread(payload.channel_id)
+    author = payload.data.get("author", {})
+    author_id = author.get("id", "Unknown")
+    content = payload.data.get("content")
+    detail = (
+        content[:2500]
+        if isinstance(content, str) and content
+        else "Content was not included in this update (an embed, pin, or metadata may have changed)."
+    )
+    await send_log(
+        guild,
+        "Uncached message updated",
+        f"**Author ID:** `{author_id}`\n"
+        f"**Channel:** {display_object(channel)}\n"
+        f"**Message ID:** `{payload.message_id}`\n"
+        f"**Updated content:** {detail}",
+    )
 
 
 @bot.event
@@ -1103,12 +1531,411 @@ async def ticket_panel(interaction: discord.Interaction) -> None:
     await interaction.response.send_message("Ticket panel posted.", ephemeral=True)
 
 
+mod_group = app_commands.Group(name="mod", description="Moderation tools")
+
+
+@mod_group.command(name="warn", description="Warn a member and create a moderation case")
+@app_commands.checks.has_permissions(manage_messages=True)
+async def mod_warn(
+    interaction: discord.Interaction, member: discord.Member, reason: str = ""
+) -> None:
+    reason = moderation_reason(interaction.guild_id, reason)
+    if not isinstance(interaction.user, discord.Member) or not can_target(interaction.user, member):
+        return await interaction.response.send_message(
+            "You cannot moderate that member because of the role hierarchy.", ephemeral=True
+        )
+    await notify_moderation_target(member, "warned", reason)
+    case_id = await record_moderation(
+        interaction.guild, member.id, interaction.user.id, "warn", reason
+    )
+    await interaction.response.send_message(
+        f"Warned {member.mention}. Case **#{case_id}**.", ephemeral=True
+    )
+
+
+@mod_group.command(name="warnings", description="Show a member's warning history")
+@app_commands.checks.has_permissions(manage_messages=True)
+async def mod_warnings(interaction: discord.Interaction, member: discord.Member) -> None:
+    rows = [
+        row
+        for row in store.moderation_cases(interaction.guild_id, member.id, 50)
+        if row["action"] == "warn"
+    ]
+    description = "\n".join(
+        f"**#{row['id']}** · <t:{row['created_at']}:d> · {row['reason']}"
+        for row in rows[:15]
+    ) or "No warnings."
+    await interaction.response.send_message(
+        embed=discord.Embed(
+            title=f"Warnings for {member}", description=description, color=discord.Color.orange()
+        ),
+        ephemeral=True,
+    )
+
+
+@mod_group.command(name="clear-warnings", description="Remove all recorded warnings for a member")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def mod_clear_warnings(
+    interaction: discord.Interaction, member: discord.Member
+) -> None:
+    removed = store.clear_warnings(interaction.guild_id, member.id)
+    await interaction.response.send_message(
+        f"Removed **{removed}** warning(s) for {member.mention}.", ephemeral=True
+    )
+
+
+@mod_group.command(name="timeout", description="Temporarily timeout a member")
+@app_commands.checks.has_permissions(moderate_members=True)
+@app_commands.checks.bot_has_permissions(moderate_members=True)
+async def mod_timeout(
+    interaction: discord.Interaction,
+    member: discord.Member,
+    duration: str,
+    reason: str = "",
+) -> None:
+    reason = moderation_reason(interaction.guild_id, reason)
+    seconds = parse_duration(duration)
+    if not seconds or seconds > 28 * 86400:
+        return await interaction.response.send_message(
+            "Use a duration such as `10m`, `2h`, or `7d` (maximum 28 days).", ephemeral=True
+        )
+    if not isinstance(interaction.user, discord.Member) or not can_target(interaction.user, member):
+        return await interaction.response.send_message(
+            "You cannot moderate that member because of the role hierarchy.", ephemeral=True
+        )
+    await notify_moderation_target(member, "timed out", reason, format_duration(seconds))
+    await member.timeout(timedelta(seconds=seconds), reason=reason)
+    expires = int(time.time()) + seconds
+    case_id = await record_moderation(
+        interaction.guild, member.id, interaction.user.id, "timeout", reason, expires
+    )
+    await interaction.response.send_message(
+        f"Timed out {member.mention} for **{format_duration(seconds)}**. Case **#{case_id}**.",
+        ephemeral=True,
+    )
+
+
+@mod_group.command(name="untimeout", description="Remove a member's timeout")
+@app_commands.checks.has_permissions(moderate_members=True)
+@app_commands.checks.bot_has_permissions(moderate_members=True)
+async def mod_untimeout(interaction: discord.Interaction, member: discord.Member) -> None:
+    if not isinstance(interaction.user, discord.Member) or not can_target(interaction.user, member):
+        return await interaction.response.send_message(
+            "You cannot moderate that member because of the role hierarchy.", ephemeral=True
+        )
+    await member.timeout(None, reason=f"Removed by {interaction.user}")
+    case_id = await record_moderation(
+        interaction.guild, member.id, interaction.user.id, "untimeout", "Timeout removed"
+    )
+    await interaction.response.send_message(
+        f"Removed {member.mention}'s timeout. Case **#{case_id}**.", ephemeral=True
+    )
+
+
+@mod_group.command(name="kick", description="Kick a member")
+@app_commands.checks.has_permissions(kick_members=True)
+@app_commands.checks.bot_has_permissions(kick_members=True)
+async def mod_kick(
+    interaction: discord.Interaction, member: discord.Member, reason: str = ""
+) -> None:
+    reason = moderation_reason(interaction.guild_id, reason)
+    if not isinstance(interaction.user, discord.Member) or not can_target(interaction.user, member):
+        return await interaction.response.send_message(
+            "You cannot moderate that member because of the role hierarchy.", ephemeral=True
+        )
+    await notify_moderation_target(member, "kicked", reason)
+    case_id = await record_moderation(
+        interaction.guild, member.id, interaction.user.id, "kick", reason
+    )
+    await member.kick(reason=reason)
+    await interaction.response.send_message(
+        f"Kicked **{member}**. Case **#{case_id}**.", ephemeral=True
+    )
+
+
+@mod_group.command(name="ban", description="Ban a member")
+@app_commands.checks.has_permissions(ban_members=True)
+@app_commands.checks.bot_has_permissions(ban_members=True)
+async def mod_ban(
+    interaction: discord.Interaction,
+    member: discord.Member,
+    reason: str = "",
+    delete_message_days: app_commands.Range[int, 0, 7] = 0,
+) -> None:
+    reason = moderation_reason(interaction.guild_id, reason)
+    if not isinstance(interaction.user, discord.Member) or not can_target(interaction.user, member):
+        return await interaction.response.send_message(
+            "You cannot moderate that member because of the role hierarchy.", ephemeral=True
+        )
+    await notify_moderation_target(member, "banned", reason)
+    case_id = await record_moderation(
+        interaction.guild, member.id, interaction.user.id, "ban", reason
+    )
+    await member.ban(reason=reason, delete_message_seconds=delete_message_days * 86400)
+    await interaction.response.send_message(
+        f"Banned **{member}**. Case **#{case_id}**.", ephemeral=True
+    )
+
+
+@mod_group.command(name="unban", description="Unban a user by Discord ID")
+@app_commands.checks.has_permissions(ban_members=True)
+@app_commands.checks.bot_has_permissions(ban_members=True)
+async def mod_unban(
+    interaction: discord.Interaction, user_id: str, reason: str = ""
+) -> None:
+    reason = moderation_reason(interaction.guild_id, reason)
+    if not user_id.isdigit():
+        return await interaction.response.send_message("Provide a numeric user ID.", ephemeral=True)
+    target = discord.Object(id=int(user_id))
+    await interaction.guild.unban(target, reason=reason)
+    case_id = await record_moderation(
+        interaction.guild, int(user_id), interaction.user.id, "unban", reason
+    )
+    await interaction.response.send_message(
+        f"Unbanned `{user_id}`. Case **#{case_id}**.", ephemeral=True
+    )
+
+
+@mod_group.command(name="purge", description="Bulk-delete recent messages")
+@app_commands.checks.has_permissions(manage_messages=True)
+@app_commands.checks.bot_has_permissions(manage_messages=True)
+async def mod_purge(
+    interaction: discord.Interaction,
+    amount: app_commands.Range[int, 1, 500],
+    member: discord.Member | None = None,
+) -> None:
+    if not isinstance(interaction.channel, discord.TextChannel):
+        return await interaction.response.send_message(
+            "Use this in a standard text channel.", ephemeral=True
+        )
+    await interaction.response.defer(ephemeral=True)
+    deleted = await interaction.channel.purge(
+        limit=amount, check=(lambda message: message.author == member) if member else None
+    )
+    await interaction.followup.send(f"Deleted **{len(deleted)}** message(s).", ephemeral=True)
+
+
+@mod_group.command(name="lock", description="Prevent members from sending in a channel")
+@app_commands.checks.has_permissions(manage_channels=True)
+@app_commands.checks.bot_has_permissions(manage_channels=True)
+async def mod_lock(
+    interaction: discord.Interaction,
+    channel: discord.TextChannel | None = None,
+    reason: str = "Channel locked",
+) -> None:
+    target = channel or interaction.channel
+    if not isinstance(target, discord.TextChannel):
+        return await interaction.response.send_message("Select a text channel.", ephemeral=True)
+    await target.set_permissions(
+        interaction.guild.default_role, send_messages=False, reason=reason
+    )
+    await interaction.response.send_message(f"Locked {target.mention}.", ephemeral=True)
+
+
+@mod_group.command(name="unlock", description="Allow members to send in a channel again")
+@app_commands.checks.has_permissions(manage_channels=True)
+@app_commands.checks.bot_has_permissions(manage_channels=True)
+async def mod_unlock(
+    interaction: discord.Interaction, channel: discord.TextChannel | None = None
+) -> None:
+    target = channel or interaction.channel
+    if not isinstance(target, discord.TextChannel):
+        return await interaction.response.send_message("Select a text channel.", ephemeral=True)
+    await target.set_permissions(
+        interaction.guild.default_role, send_messages=None, reason=f"Unlocked by {interaction.user}"
+    )
+    await interaction.response.send_message(f"Unlocked {target.mention}.", ephemeral=True)
+
+
+voice_group = app_commands.Group(name="voice", description="Voice-channel utilities")
+
+
+@voice_group.command(name="join", description="Make Response join your voice channel")
+async def voice_join(interaction: discord.Interaction) -> None:
+    client = await get_voice_client(interaction)
+    if client:
+        await ephemeral(interaction, f"Joined {client.channel.mention}.")
+
+
+@voice_group.command(name="leave", description="Disconnect Response from voice")
+async def voice_leave(interaction: discord.Interaction) -> None:
+    client = await get_voice_client(interaction, connect=False)
+    if interaction.response.is_done() and not client:
+        return
+    if not client:
+        return await ephemeral(interaction, "Response is not connected to voice.")
+    await client.disconnect(force=True)
+    await ephemeral(interaction, "Disconnected from voice.")
+
+
+@voice_group.command(name="stop", description="Stop the currently playing sound")
+async def voice_stop(interaction: discord.Interaction) -> None:
+    client = await get_voice_client(interaction, connect=False)
+    if interaction.response.is_done() and not client:
+        return
+    if not client or not client.is_playing():
+        return await ephemeral(interaction, "Nothing is currently playing.")
+    client.stop()
+    await ephemeral(interaction, "Stopped playback.")
+
+
+@voice_group.command(name="move-all", description="Move everyone between voice channels")
+@app_commands.checks.has_permissions(move_members=True)
+@app_commands.checks.bot_has_permissions(move_members=True)
+async def voice_move_all(
+    interaction: discord.Interaction,
+    source: discord.VoiceChannel,
+    destination: discord.VoiceChannel,
+) -> None:
+    await interaction.response.defer(ephemeral=True)
+    moved = 0
+    for member in list(source.members):
+        try:
+            await member.move_to(destination, reason=f"Moved by {interaction.user}")
+            moved += 1
+        except discord.HTTPException:
+            continue
+    await interaction.followup.send(
+        f"Moved **{moved}** member(s) to {destination.mention}.", ephemeral=True
+    )
+
+
+@voice_group.command(name="disconnect", description="Disconnect a member from voice")
+@app_commands.checks.has_permissions(move_members=True)
+@app_commands.checks.bot_has_permissions(move_members=True)
+async def voice_disconnect(
+    interaction: discord.Interaction, member: discord.Member
+) -> None:
+    await member.move_to(None, reason=f"Disconnected by {interaction.user}")
+    await interaction.response.send_message(
+        f"Disconnected {member.mention} from voice.", ephemeral=True
+    )
+
+
+@voice_group.command(name="mute", description="Set a member's server voice mute")
+@app_commands.checks.has_permissions(mute_members=True)
+@app_commands.checks.bot_has_permissions(mute_members=True)
+async def voice_mute(
+    interaction: discord.Interaction, member: discord.Member, enabled: bool = True
+) -> None:
+    await member.edit(mute=enabled, reason=f"Changed by {interaction.user}")
+    await interaction.response.send_message(
+        f"{'Muted' if enabled else 'Unmuted'} {member.mention}.", ephemeral=True
+    )
+
+
+@voice_group.command(name="deafen", description="Set a member's server voice deafen")
+@app_commands.checks.has_permissions(deafen_members=True)
+@app_commands.checks.bot_has_permissions(deafen_members=True)
+async def voice_deafen(
+    interaction: discord.Interaction, member: discord.Member, enabled: bool = True
+) -> None:
+    await member.edit(deafen=enabled, reason=f"Changed by {interaction.user}")
+    await interaction.response.send_message(
+        f"{'Deafened' if enabled else 'Undeafened'} {member.mention}.", ephemeral=True
+    )
+
+
+sfx_group = app_commands.Group(name="sfx", description="Saved sound-effect controls")
+
+
+@sfx_group.command(name="list", description="List saved sound effects")
+async def sfx_list(interaction: discord.Interaction) -> None:
+    rows = store.list_sound_effects(interaction.guild_id)
+    names = ", ".join(f"`{row['name']}`" for row in rows) or "No sounds saved yet."
+    await interaction.response.send_message(
+        embed=discord.Embed(title="Saved sound effects", description=names[:4000]),
+        ephemeral=True,
+    )
+
+
+@sfx_group.command(name="play", description="Play a saved sound effect in your voice channel")
+@app_commands.checks.cooldown(1, 2.0, key=lambda i: (i.guild_id, i.user.id))
+async def sfx_play(interaction: discord.Interaction, name: str) -> None:
+    if not interaction.guild or not isinstance(interaction.user, discord.Member):
+        return await interaction.response.send_message("This only works in a server.", ephemeral=True)
+    config = store.get_config(interaction.guild.id)["voice"]
+    cooldown_key = (interaction.guild.id, interaction.user.id)
+    remaining = int(config["sfx_cooldown"]) - (
+        time.monotonic() - sfx_cooldowns.get(cooldown_key, 0)
+    )
+    if remaining > 0:
+        return await interaction.response.send_message(
+            f"Wait **{remaining + 1}s** before playing another sound.", ephemeral=True
+        )
+    sound = store.get_sound_effect(interaction.guild.id, name)
+    if not sound:
+        return await interaction.response.send_message("That sound is not saved.", ephemeral=True)
+    ffmpeg = ffmpeg_executable()
+    if not ffmpeg:
+        return await interaction.response.send_message(
+            "FFmpeg is unavailable. Reinstall the packages in `requirements.txt`.", ephemeral=True
+        )
+    client = await get_voice_client(interaction)
+    if not client:
+        return
+    if client.is_playing():
+        return await ephemeral(
+            interaction, "Another sound is already playing. Use `/voice stop` first."
+        )
+    source_value = sound["source"]
+    before_options = ""
+    if sound["source_type"] == "file":
+        source_path = (store.ROOT / source_value).resolve()
+        if not source_path.is_relative_to(SFX_ROOT.resolve()) or not source_path.is_file():
+            return await ephemeral(interaction, "The saved audio file is missing.")
+        source_value = str(source_path)
+    else:
+        before_options = "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"
+    try:
+        audio = discord.FFmpegPCMAudio(
+            source_value,
+            executable=ffmpeg,
+            before_options=before_options,
+            options="-vn -loglevel warning",
+        )
+        volume = min(
+            float(config["max_volume"]),
+            max(0.0, float(sound["volume"]) * float(config["default_volume"])),
+        )
+        client.play(
+            discord.PCMVolumeTransformer(audio, volume=volume),
+            after=lambda error: log.error("SFX playback failed: %s", error) if error else None,
+        )
+    except (discord.ClientException, OSError) as exc:
+        return await ephemeral(interaction, f"Could not start playback: {exc}")
+    sfx_cooldowns[cooldown_key] = time.monotonic()
+    await ephemeral(interaction, f"Playing **{sound['name']}** in {client.channel.mention}.")
+
+
+@sfx_play.autocomplete("name")
+async def sfx_name_autocomplete(
+    interaction: discord.Interaction, current: str
+) -> list[app_commands.Choice[str]]:
+    if not interaction.guild_id:
+        return []
+    return [
+        app_commands.Choice(name=row["name"], value=row["name"])
+        for row in store.list_sound_effects(interaction.guild_id)
+        if current.lower() in row["name"].lower()
+    ][:25]
+
+
+bot.tree.add_command(mod_group)
+bot.tree.add_command(voice_group)
+bot.tree.add_command(sfx_group)
+
+
 @bot.tree.error
 async def command_error(interaction: discord.Interaction, error: app_commands.AppCommandError) -> None:
     if isinstance(error, app_commands.MissingPermissions):
         message = "You do not have permission to use that command."
+    elif isinstance(error, app_commands.BotMissingPermissions):
+        message = "Response is missing a Discord permission required for that command."
+    elif isinstance(error, app_commands.CommandOnCooldown):
+        message = f"That command is on cooldown for {error.retry_after:.1f}s."
     else:
-        log.exception("Application command failed", exc_info=error)
+        log.error("Application command failed: %s", error, exc_info=error)
         message = "That command failed. Check the bot logs for details."
     if interaction.response.is_done():
         await interaction.followup.send(message, ephemeral=True)

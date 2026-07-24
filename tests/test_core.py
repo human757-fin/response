@@ -34,6 +34,8 @@ class StoreTests(unittest.TestCase):
     def setUp(self) -> None:
         with self.store.connect() as db:
             for table in (
+                "sound_effects",
+                "moderation_cases",
                 "giveaway_entries",
                 "giveaways",
                 "scheduled_messages",
@@ -102,6 +104,32 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(dashboard["total_xp"], 500)
         self.assertEqual(dashboard["leaderboard"][0]["username"], "Alpha")
         self.assertEqual(dashboard["events"][0]["event_type"], "test_event")
+
+    def test_moderation_cases_can_be_filtered_and_warnings_cleared(self) -> None:
+        first = self.store.add_moderation_case(1, 20, 99, "warn", "First warning")
+        self.store.add_moderation_case(1, 20, 99, "timeout", "Cooling off", 123456)
+        self.store.add_moderation_case(1, 21, 99, "warn", "Other member")
+
+        cases = self.store.moderation_cases(1, user_id=20)
+        self.assertEqual({case["action"] for case in cases}, {"warn", "timeout"})
+        self.assertEqual(first, min(case["id"] for case in cases))
+        self.assertEqual(self.store.clear_warnings(1, 20), 1)
+        self.assertEqual(
+            [case["action"] for case in self.store.moderation_cases(1, user_id=20)],
+            ["timeout"],
+        )
+
+    def test_sound_effects_can_be_saved_replaced_and_deleted(self) -> None:
+        self.store.save_sound_effect(1, "AirHorn", "url", "https://old.test/a.mp3", 20, 0.8)
+        self.store.save_sound_effect(1, "airhorn", "url", "https://new.test/a.mp3", 21, 1.2)
+
+        sounds = self.store.list_sound_effects(1)
+        self.assertEqual(len(sounds), 1)
+        self.assertEqual(sounds[0]["source"], "https://new.test/a.mp3")
+        self.assertEqual(sounds[0]["volume"], 1.2)
+        deleted = self.store.delete_sound_effect(1, sounds[0]["id"])
+        self.assertEqual(deleted["source_type"], "url")
+        self.assertEqual(self.store.list_sound_effects(1), [])
 
     def test_giveaway_schema_keeps_weighted_entries(self) -> None:
         with self.store.connect() as db:

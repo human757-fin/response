@@ -9,6 +9,7 @@ import secrets
 import sqlite3
 import threading
 import time
+import uuid
 from copy import deepcopy
 from contextlib import contextmanager
 from pathlib import Path
@@ -102,8 +103,15 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "channel": None,
         "message_delete": True,
         "message_edit": True,
+        "bulk_message_delete": True,
+        "reaction_events": True,
         "member_events": True,
+        "member_updates": True,
+        "voice_events": True,
         "moderation": True,
+        "thread_events": True,
+        "scheduled_event_events": True,
+        "audit_log_events": True,
     },
     "tickets": {
         "enabled": False,
@@ -111,6 +119,35 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "support_roles": [],
         "panel_channel": None,
         "welcome_message": "Thanks for contacting support. Describe how we can help.",
+    },
+    "moderation": {
+        "dm_on_action": True,
+        "case_log_channel": None,
+        "default_reason": "No reason provided",
+    },
+    "antinuke": {
+        "enabled": False,
+        "log_channel": None,
+        "window_seconds": 15,
+        "channel_create_limit": 4,
+        "channel_delete_limit": 2,
+        "role_create_limit": 4,
+        "role_delete_limit": 2,
+        "ban_limit": 3,
+        "kick_limit": 3,
+        "action": "remove_roles",
+        "timeout_minutes": 60,
+        "trusted_users": [],
+        "trusted_roles": [],
+    },
+    "voice": {
+        "enabled": True,
+        "allow_everyone": False,
+        "allowed_roles": [],
+        "default_volume": 0.7,
+        "max_volume": 1.5,
+        "sfx_cooldown": 5,
+        "max_upload_mb": 15,
     },
     "giveaways": {"enabled": True, "role_entries": {}},
     "scheduled_messages": {"enabled": True},
@@ -330,6 +367,33 @@ MYSQL_SCHEMA = (
         KEY audit_guild (guild_id, id)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
     """,
+    """
+    CREATE TABLE IF NOT EXISTS moderation_cases (
+        id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+        guild_id BIGINT UNSIGNED NOT NULL,
+        user_id BIGINT UNSIGNED NOT NULL,
+        moderator_id BIGINT UNSIGNED NOT NULL,
+        action VARCHAR(40) NOT NULL,
+        reason TEXT NOT NULL,
+        expires_at BIGINT NULL,
+        created_at BIGINT NOT NULL,
+        KEY cases_guild (guild_id, id),
+        KEY cases_user (guild_id, user_id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS sound_effects (
+        id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+        guild_id BIGINT UNSIGNED NOT NULL,
+        name VARCHAR(64) NOT NULL,
+        source_type VARCHAR(10) NOT NULL,
+        source TEXT NOT NULL,
+        created_by BIGINT UNSIGNED NOT NULL,
+        created_at BIGINT NOT NULL,
+        volume DOUBLE NOT NULL DEFAULT 1.0,
+        UNIQUE KEY sfx_guild_name (guild_id, name)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+    """,
 )
 
 
@@ -398,8 +462,30 @@ CREATE TABLE IF NOT EXISTS audit_events (
     detail TEXT NOT NULL,
     created_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS moderation_cases (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    moderator_id INTEGER NOT NULL,
+    action TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    expires_at INTEGER,
+    created_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS sound_effects (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_id INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    source_type TEXT NOT NULL,
+    source TEXT NOT NULL,
+    created_by INTEGER NOT NULL,
+    created_at INTEGER NOT NULL,
+    volume REAL NOT NULL DEFAULT 1.0,
+    UNIQUE (guild_id, name)
+);
 CREATE INDEX IF NOT EXISTS members_leaderboard ON members(guild_id, xp DESC);
 CREATE INDEX IF NOT EXISTS schedules_due ON scheduled_messages(enabled, send_at);
+CREATE INDEX IF NOT EXISTS cases_user ON moderation_cases(guild_id, user_id);
 """
 
 
@@ -642,6 +728,135 @@ def dashboard_data(guild_id: int) -> dict[str, Any]:
 
 def create_session() -> str:
     return secrets.token_urlsafe(32)
+
+
+def add_moderation_case(
+    guild_id: int,
+    user_id: int,
+    moderator_id: int,
+    action: str,
+    reason: str,
+    expires_at: int | None = None,
+) -> int:
+    with connect() as db:
+        cursor = db.execute(
+            """
+            INSERT INTO moderation_cases(
+                guild_id, user_id, moderator_id, action, reason, expires_at, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                guild_id,
+                user_id,
+                moderator_id,
+                action[:40],
+                reason[:2000],
+                expires_at,
+                int(time.time()),
+            ),
+        )
+        return int(cursor.lastrowid)
+
+
+def moderation_cases(
+    guild_id: int, user_id: int | None = None, limit: int = 100
+) -> list[dict[str, Any]]:
+    query = (
+        "SELECT id, user_id, moderator_id, action, reason, expires_at, created_at "
+        "FROM moderation_cases WHERE guild_id=?"
+    )
+    parameters: tuple[Any, ...] = (guild_id,)
+    if user_id is not None:
+        query += " AND user_id=?"
+        parameters += (user_id,)
+    query += " ORDER BY id DESC LIMIT ?"
+    parameters += (min(max(limit, 1), 500),)
+    with connect() as db:
+        rows = db.execute(query, parameters).fetchall()
+    return [dict(row) for row in rows]
+
+
+def clear_warnings(guild_id: int, user_id: int) -> int:
+    with connect() as db:
+        cursor = db.execute(
+            "DELETE FROM moderation_cases WHERE guild_id=? AND user_id=? AND action='warn'",
+            (guild_id, user_id),
+        )
+        return int(cursor.rowcount)
+
+
+def list_sound_effects(guild_id: int) -> list[dict[str, Any]]:
+    with connect() as db:
+        rows = db.execute(
+            "SELECT id, name, source_type, source, created_by, created_at, volume "
+            "FROM sound_effects WHERE guild_id=? ORDER BY name",
+            (guild_id,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def get_sound_effect(guild_id: int, name: str) -> dict[str, Any] | None:
+    with connect() as db:
+        row = db.execute(
+            "SELECT id, name, source_type, source, created_by, created_at, volume "
+            "FROM sound_effects WHERE guild_id=? AND name=?",
+            (guild_id, name.lower()),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def save_sound_effect(
+    guild_id: int,
+    name: str,
+    source_type: str,
+    source: str,
+    created_by: int,
+    volume: float,
+) -> int:
+    now = int(time.time())
+    with connect() as db:
+        cursor = db.execute(
+            dialect(
+                """
+                INSERT INTO sound_effects(
+                    guild_id, name, source_type, source, created_by, created_at, volume
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(guild_id, name) DO UPDATE SET
+                    source_type=excluded.source_type, source=excluded.source,
+                    created_by=excluded.created_by, created_at=excluded.created_at,
+                    volume=excluded.volume
+                """,
+                """
+                INSERT INTO sound_effects(
+                    guild_id, name, source_type, source, created_by, created_at, volume
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON DUPLICATE KEY UPDATE
+                    source_type=VALUES(source_type), source=VALUES(source),
+                    created_by=VALUES(created_by), created_at=VALUES(created_at),
+                    volume=VALUES(volume)
+                """,
+            ),
+            (guild_id, name.lower(), source_type, source, created_by, now, volume),
+        )
+        return int(cursor.lastrowid or 0)
+
+
+def delete_sound_effect(guild_id: int, sound_id: int) -> dict[str, Any] | None:
+    with connect() as db:
+        row = db.execute(
+            "SELECT id, source_type, source FROM sound_effects WHERE guild_id=? AND id=?",
+            (guild_id, sound_id),
+        ).fetchone()
+        if row:
+            db.execute(
+                "DELETE FROM sound_effects WHERE guild_id=? AND id=?", (guild_id, sound_id)
+            )
+    return dict(row) if row else None
+
+
+def sound_file_name(original_name: str) -> str:
+    suffix = Path(original_name).suffix.lower()
+    return f"{uuid.uuid4().hex}{suffix}"
 
 
 init_db()

@@ -6,8 +6,11 @@ import hmac
 import json
 import logging
 import os
+import re
 import time
+from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from aiohttp import web
 
@@ -24,6 +27,10 @@ WEBUI_PASSWORD = os.getenv("WEBUI_PASSWORD", "")
 COOKIE_SECURE = os.getenv("WEBUI_SECURE_COOKIE", "0") == "1"
 SESSIONS: dict[str, float] = {}
 SESSION_TTL = 7 * 86400
+SFX_ROOT = store.ROOT / "data" / "sfx"
+SFX_ROOT.mkdir(parents=True, exist_ok=True)
+SFX_NAME = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
+SFX_EXTENSIONS = {".mp3", ".wav", ".ogg", ".m4a", ".webm", ".flac"}
 
 
 PAGE = r"""<!doctype html>
@@ -106,7 +113,9 @@ PAGE = r"""<!doctype html>
     .toast{opacity:0;transform:translateY(8px);transition:.2s;padding:10px 14px;background:#1c2530;border:1px solid #314052;
       border-radius:9px;box-shadow:var(--shadow);pointer-events:none}.toast.show{opacity:1;transform:none}
     .danger{background:transparent;color:#ff8c8c;border:1px solid #673434;border-radius:8px;padding:7px 10px}
-    .toolbar{display:flex;gap:10px;align-items:end;margin-bottom:16px}.toolbar label{flex:1}
+    .toolbar{display:flex;gap:10px;align-items:end;margin-bottom:16px;flex-wrap:wrap}.toolbar label{flex:1;min-width:150px}
+    .settings+.card{margin-top:16px}.source-pill{display:inline-block;padding:2px 7px;border-radius:99px;background:#252b39;
+      color:#b8c0d0;font-size:11px;text-transform:uppercase}
     @media(max-width:1000px){.grid{grid-template-columns:repeat(2,1fr)}.settings{grid-template-columns:1fr}}
     @media(max-width:720px){aside{position:static;width:auto;height:auto;border-right:0;border-bottom:1px solid var(--line)}
       aside nav{display:flex;overflow:auto}.nav-section,.server-select{display:none}nav button{white-space:nowrap;width:auto}
@@ -134,7 +143,9 @@ PAGE = r"""<!doctype html>
         <button data-page="giveaways">✦ &nbsp; Giveaways</button>
         <div class="nav-section">Management</div>
         <button data-page="welcome">☻ &nbsp; Welcome & boost</button>
-        <button data-page="moderation">⌁ &nbsp; Logs & tickets</button>
+        <button data-page="moderation">⌁ &nbsp; Moderation</button>
+        <button data-page="antinuke">⚿ &nbsp; Anti-nuke</button>
+        <button data-page="sfx">♫ &nbsp; Voice & SFX</button>
         <button data-page="messages">▤ &nbsp; Messages</button>
       </nav>
       <div class="server-select"><label><span class="field-name">Discord server</span><select id="guild"></select></label></div>
@@ -176,15 +187,18 @@ PAGE = r"""<!doctype html>
       document.querySelectorAll("nav button").forEach(x=>x.classList.toggle("active",x===b));render()}));
     $("#save").addEventListener("click",async()=>{try{await api(`/api/guilds/${state.guild.guild_id}/config`,{method:"PUT",body:JSON.stringify(state.config)});
       state.dirty=false;$("#save").style.display="none";toast("Settings saved")}catch(e){toast(e.message,true)}});
-    const pageMap={leveling:["leveling"],economy:["economy"],welcome:["welcome","boost"],moderation:["logs","tickets"]};
+    const pageMap={leveling:["leveling"],economy:["economy"],welcome:["welcome","boost"],
+      moderation:["logs","tickets","moderation"],antinuke:["antinuke"],sfx:["voice"]};
     function title(){return {dashboard:"Overview",leveling:"Leveling",economy:"Economy",giveaways:"Giveaways",welcome:"Welcome & boost",
-      moderation:"Logs & tickets",messages:"Scheduled messages"}[state.page]}
+      moderation:"Moderation",antinuke:"Anti-nuke",sfx:"Voice & sound effects",messages:"Scheduled messages"}[state.page]}
     async function render(){
       $("#pageTitle").textContent=title();$("#serverName").textContent=state.guild?.name||"No server selected";
       $("#save").style.display=pageMap[state.page]?"block":"none";
       if(state.page==="dashboard")return renderDashboard();
       if(state.page==="giveaways")return renderGiveaways();
       if(state.page==="messages")return renderMessages();
+      if(state.page==="moderation")return renderModeration();
+      if(state.page==="sfx")return renderSfx();
       renderSettings(pageMap[state.page]||[]);
     }
     async function renderDashboard(){
@@ -202,7 +216,12 @@ PAGE = r"""<!doctype html>
       '<div class="empty">Members appear after earning XP.</div>'}
     function pretty(key){return key.replaceAll("_"," ").replace(/\b\w/g,c=>c.toUpperCase())}
     function renderSettings(sections){
-      $("#content").innerHTML=`<div class="settings">${sections.map(name=>section(name,state.config[name])).join("")}</div>`;
+      $("#content").innerHTML=settingsMarkup(sections);bindSettings();
+    }
+    function settingsMarkup(sections){
+      return `<div class="settings">${sections.map(name=>section(name,state.config[name])).join("")}</div>`;
+    }
+    function bindSettings(){
       $("#content").querySelectorAll("[data-path]").forEach(el=>el.addEventListener("input",changeSetting));
     }
     function section(name,obj){return `<div class="section"><div class="section-title"><h2>${pretty(name)}</h2></div><div class="fields">
@@ -246,6 +265,38 @@ PAGE = r"""<!doctype html>
       $("#scheduleForm").addEventListener("submit",createSchedule);
       document.querySelectorAll("[data-delete]").forEach(b=>b.addEventListener("click",async()=>{await api(`/api/schedules/${b.dataset.delete}`,{method:"DELETE"});toast("Schedule deleted");renderMessages()}));
     }
+    async function renderModeration(){
+      const d=await api(`/api/guilds/${state.guild.guild_id}/moderation-cases`);
+      $("#content").innerHTML=settingsMarkup(pageMap.moderation)+`<div class="card"><h2>Recent moderation cases</h2>
+        ${d.cases.length?`<table><thead><tr><th>Case</th><th>Action</th><th>User</th><th>Moderator</th><th>Reason</th><th>Date</th></tr></thead><tbody>
+        ${d.cases.map(c=>`<tr><td>#${c.id}</td><td>${esc(c.action)}</td><td>${c.user_id}</td><td>${c.moderator_id}</td>
+          <td>${esc(c.reason)}</td><td>${new Date(c.created_at*1000).toLocaleString()}</td></tr>`).join("")}</tbody></table>`:
+          '<div class="empty">Moderation cases will appear here.</div>'}</div>`;bindSettings();
+    }
+    async function renderSfx(){
+      const d=await api(`/api/guilds/${state.guild.guild_id}/sfx`);
+      $("#content").innerHTML=settingsMarkup(["voice"])+`<div class="card"><h2>Sound-effect library</h2>
+        <form id="sfxForm" class="toolbar">
+          <label><span class="field-name">Name</span><input name="name" pattern="[a-z0-9_-]{1,32}" placeholder="airhorn" required></label>
+          <label><span class="field-name">Audio file</span><input name="file" type="file" accept=".mp3,.wav,.ogg,.m4a,.webm,.flac,audio/*"></label>
+          <label><span class="field-name">Or HTTPS audio link</span><input name="url" type="url" placeholder="https://example.com/sound.mp3"></label>
+          <label><span class="field-name">Volume</span><input name="volume" type="number" min="0" max="2" step="0.05" value="1"></label>
+          <button class="primary">Save sound</button>
+        </form>
+        ${d.sounds.length?`<table><thead><tr><th>Name</th><th>Source</th><th>Volume</th><th>Saved</th><th></th></tr></thead><tbody>
+        ${d.sounds.map(s=>`<tr><td><b>${esc(s.name)}</b></td><td><span class="source-pill">${esc(s.source_type)}</span></td>
+          <td>${Number(s.volume).toFixed(2)}×</td><td>${new Date(s.created_at*1000).toLocaleString()}</td>
+          <td><button class="danger" data-sfx-delete="${s.id}">Delete</button></td></tr>`).join("")}</tbody></table>`:
+          '<div class="empty">Upload a file or save an audio URL, then use /sfx play in Discord.</div>'}</div>`;
+      bindSettings();$("#sfxForm").addEventListener("submit",saveSfx);
+      document.querySelectorAll("[data-sfx-delete]").forEach(b=>b.addEventListener("click",async()=>{
+        await api(`/api/guilds/${state.guild.guild_id}/sfx/${b.dataset.sfxDelete}`,{method:"DELETE"});
+        toast("Sound deleted");renderSfx()}));
+    }
+    async function saveSfx(e){e.preventDefault();const form=new FormData(e.target);
+      try{const response=await fetch(`/api/guilds/${state.guild.guild_id}/sfx`,{method:"POST",body:form});
+        const data=await response.json();if(!response.ok)throw Error(data.error||"Upload failed");
+        toast("Sound saved");renderSfx()}catch(err){toast(err.message,true)}}
     async function createSchedule(e){e.preventDefault();const f=new FormData(e.target);
       try{await api(`/api/guilds/${state.guild.guild_id}/schedules`,{method:"POST",body:JSON.stringify({channel_id:f.get("channel_id"),content:f.get("content"),minutes:Number(f.get("minutes"))})});
         toast("Message scheduled");renderMessages()}catch(err){toast(err.message,true)}}
@@ -348,6 +399,118 @@ async def dashboard(request: web.Request) -> web.Response:
     return json_response(store.dashboard_data(guild_id(request)))
 
 
+async def moderation_cases(request: web.Request) -> web.Response:
+    return json_response({"cases": store.moderation_cases(guild_id(request), limit=200)})
+
+
+def remove_sound_file(sound: dict[str, Any] | None) -> None:
+    if not sound or sound.get("source_type") != "file":
+        return
+    path = (store.ROOT / str(sound["source"])).resolve()
+    if path.is_relative_to(SFX_ROOT.resolve()):
+        path.unlink(missing_ok=True)
+
+
+async def sound_effects(request: web.Request) -> web.Response:
+    sounds = store.list_sound_effects(guild_id(request))
+    return json_response(
+        {
+            "sounds": [
+                {key: value for key, value in sound.items() if key != "source"}
+                for sound in sounds
+            ]
+        }
+    )
+
+
+async def sound_effect_create(request: web.Request) -> web.Response:
+    target = guild_id(request)
+    if not request.content_type.startswith("multipart/"):
+        return json_response({"error": "Sound effects must use multipart form data."}, 400)
+    voice_config = store.get_config(target)["voice"]
+    maximum = min(max(int(voice_config["max_upload_mb"]), 1), 30) * 1024 * 1024
+    fields: dict[str, str] = {}
+    uploaded_path: Path | None = None
+
+    try:
+        reader = await request.multipart()
+        async for part in reader:
+            if part.name == "file" and part.filename:
+                suffix = Path(part.filename).suffix.lower()
+                if suffix not in SFX_EXTENSIONS:
+                    return json_response(
+                        {"error": "Use an MP3, WAV, OGG, M4A, WebM, or FLAC file."}, 400
+                    )
+                target_directory = SFX_ROOT / str(target)
+                target_directory.mkdir(parents=True, exist_ok=True)
+                uploaded_path = target_directory / store.sound_file_name(part.filename)
+                size = 0
+                with uploaded_path.open("wb") as output:
+                    while chunk := await part.read_chunk(64 * 1024):
+                        size += len(chunk)
+                        if size > maximum:
+                            raise ValueError(
+                                f"Audio files are limited to {maximum // (1024 * 1024)} MB."
+                            )
+                        output.write(chunk)
+            elif part.name:
+                fields[part.name] = (await part.text()).strip()
+
+        name = fields.get("name", "").lower()
+        if not SFX_NAME.fullmatch(name):
+            raise ValueError(
+                "Name must start with a letter or number and use up to 32 lowercase "
+                "letters, numbers, hyphens, or underscores."
+            )
+        try:
+            volume = float(fields.get("volume", "1"))
+        except ValueError as exc:
+            raise ValueError("Volume must be a number from 0 to 2.") from exc
+        if not 0 <= volume <= 2:
+            raise ValueError("Volume must be between 0 and 2.")
+
+        url = fields.get("url", "")
+        if uploaded_path:
+            source_type = "file"
+            source = str(uploaded_path.relative_to(store.ROOT))
+        elif url:
+            parsed = urlparse(url)
+            if parsed.scheme not in {"http", "https"} or not parsed.netloc or len(url) > 2000:
+                raise ValueError("Enter a valid HTTP or HTTPS audio link.")
+            source_type = "url"
+            source = url
+        else:
+            raise ValueError("Choose an audio file or enter an audio link.")
+
+        previous = store.get_sound_effect(target, name)
+        store.save_sound_effect(target, name, source_type, source, 0, volume)
+        if previous and previous.get("source") != source:
+            remove_sound_file(previous)
+        store.add_audit(target, "sfx_saved", f"Saved sound effect: {name}")
+        return json_response({"ok": True, "name": name}, 201)
+    except ValueError as exc:
+        if uploaded_path:
+            uploaded_path.unlink(missing_ok=True)
+        return json_response({"error": str(exc)}, 400)
+    except (OSError, web.HTTPException) as exc:
+        if uploaded_path:
+            uploaded_path.unlink(missing_ok=True)
+        log.warning("Could not save sound effect: %s", exc)
+        return json_response({"error": "The sound effect could not be saved."}, 400)
+
+
+async def sound_effect_delete(request: web.Request) -> web.Response:
+    try:
+        sound_id = int(request.match_info["sound_id"])
+    except ValueError:
+        return json_response({"error": "Invalid sound-effect ID"}, 400)
+    sound = store.delete_sound_effect(guild_id(request), sound_id)
+    if not sound:
+        return json_response({"error": "Sound effect not found"}, 404)
+    remove_sound_file(sound)
+    return json_response({"ok": True})
+
+
 async def giveaways(request: web.Request) -> web.Response:
     target = guild_id(request)
     with store.connect() as db:
@@ -422,7 +585,7 @@ async def schedule_delete(request: web.Request) -> web.Response:
 
 
 def create_app() -> web.Application:
-    app = web.Application(middlewares=[auth_middleware], client_max_size=1024 * 1024)
+    app = web.Application(middlewares=[auth_middleware], client_max_size=32 * 1024 * 1024)
     app.router.add_get("/", index)
     app.router.add_get("/health", health)
     app.router.add_post("/api/login", login)
@@ -430,6 +593,10 @@ def create_app() -> web.Application:
     app.router.add_get("/api/guilds/{guild_id}/config", config_get)
     app.router.add_put("/api/guilds/{guild_id}/config", config_put)
     app.router.add_get("/api/guilds/{guild_id}/dashboard", dashboard)
+    app.router.add_get("/api/guilds/{guild_id}/moderation-cases", moderation_cases)
+    app.router.add_get("/api/guilds/{guild_id}/sfx", sound_effects)
+    app.router.add_post("/api/guilds/{guild_id}/sfx", sound_effect_create)
+    app.router.add_delete("/api/guilds/{guild_id}/sfx/{sound_id}", sound_effect_delete)
     app.router.add_get("/api/guilds/{guild_id}/giveaways", giveaways)
     app.router.add_get("/api/guilds/{guild_id}/schedules", schedules)
     app.router.add_post("/api/guilds/{guild_id}/schedules", schedule_create)

@@ -8,6 +8,10 @@
   -ticket system
   -embed
   -giveaway host
+  -moderation tools and persistent moderation cases
+  -anti-nuke protection with trusted users/roles and configurable responses
+  -voice utilities
+  -saved sound effects from uploaded files or audio links
 
 # WEB UI
 ## For leveling system
@@ -53,3 +57,18 @@
   -some roles have more enteries and they are stackable a list where you can set a role to have more enteries and a number to set how many
   -and make giveaways bot restart proof
   -in webui place to see all entries and for special multi entries just once the person and next to name a number of their entries
+
+## Moderation and anti-nuke
+  -warn, warning history and warning clearing
+  -timeouts, kicks, bans, unbans and message purges
+  -channel lock and unlock
+  -moderation cases in the web UI and optional Discord case log channel
+  -rapid channel, role, kick and ban detection using Discord audit logs
+  -configurable thresholds, time window, trusted users, trusted roles and response
+
+## Voice and SFX
+  -join, leave and stop controls
+  -move everyone between voice channels
+  -disconnect, server mute and server deafen utilities
+  -upload audio files or save HTTP(S) audio links in the web UI
+  -saved sound list, autocomplete, per-sound volume and playback cooldown
