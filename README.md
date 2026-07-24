@@ -107,8 +107,9 @@ enabled.
 
 Anti-nuke is disabled by default. The bot needs **View Audit Log** plus any
 permissions needed by its selected response, and its highest role must be above
-roles/members it needs to control. Voice playback installs PyNaCl and a bundled
-FFmpeg binary from `requirements.txt`, so the standard Python 3.12 egg can run it.
+roles/members it needs to control. Voice playback installs the
+`discord.py[voice]` dependencies and a bundled FFmpeg binary from
+`requirements.txt`, so the standard Python 3.12 egg can run it.
 
 ## Event logging
 
@@ -172,6 +173,16 @@ appropriate for local development.
 The startup line launches `webpanel.py` in the background and keeps `bot.py` as
 the Pterodactyl-managed foreground process. If the bot exits, the server is
 considered stopped and Pterodactyl can restart it.
+
+### Voice troubleshooting
+
+Discord voice close code `4006` means the voice session is no longer valid.
+Response clears the stale session and retries once with a fresh handshake. Restart
+the Pterodactyl server after updating so the startup command installs the current
+voice dependencies. If both attempts still fail, ask the Pterodactyl node
+administrator to confirm that the container can make outbound UDP connections;
+opening only the web-panel and bot health-check allocations does not provide
+Discord voice transport.
 
 ## Automatic restart after a push
 

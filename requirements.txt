@@ -1,5 +1,5 @@
 aiohttp==3.12.14
-discord.py==2.5.2
+discord.py[voice]==2.7.1
 imageio-ffmpeg==0.6.0
 Pillow==11.3.0
 PyMySQL==1.1.1

@@ -38,6 +38,7 @@ BOT_PORT = int(os.getenv("BOT_PORT", "2067"))
 DEV_GUILD_ID = int(os.getenv("DEV_GUILD_ID", "0") or 0)
 SFX_ROOT = store.ROOT / "data" / "sfx"
 SFX_ROOT.mkdir(parents=True, exist_ok=True)
+voice_connect_locks: dict[int, asyncio.Lock] = {}
 
 intents = discord.Intents.default()
 intents.members = True
@@ -158,6 +159,53 @@ async def ephemeral(interaction: discord.Interaction, message: str) -> None:
         await interaction.response.send_message(message, ephemeral=True)
 
 
+async def clear_voice_session(guild: discord.Guild) -> None:
+    stale = guild.voice_client
+    if stale:
+        try:
+            await asyncio.wait_for(stale.disconnect(force=True), timeout=10)
+        except Exception as exc:
+            log.warning("Forced voice cleanup failed in guild %s: %s", guild.id, exc)
+            stale.cleanup()
+    try:
+        await guild.change_voice_state(channel=None, self_mute=False, self_deaf=True)
+    except (discord.HTTPException, discord.ConnectionClosed):
+        pass
+    await asyncio.sleep(1)
+
+
+async def connect_voice_channel(
+    guild: discord.Guild,
+    channel: discord.VoiceChannel | discord.StageChannel,
+) -> discord.VoiceClient | None:
+    last_error: Exception | None = None
+    for attempt in range(2):
+        try:
+            client = await channel.connect(
+                timeout=25,
+                reconnect=True,
+                self_deaf=True,
+            )
+            if client.is_connected():
+                return client
+            last_error = RuntimeError("Discord returned a disconnected voice client")
+        except (
+            asyncio.TimeoutError,
+            discord.ConnectionClosed,
+            discord.ClientException,
+        ) as exc:
+            last_error = exc
+        log.warning(
+            "Voice connection attempt %s failed in guild %s: %s",
+            attempt + 1,
+            guild.id,
+            last_error,
+        )
+        await clear_voice_session(guild)
+    log.error("Could not establish a fresh voice session in guild %s: %s", guild.id, last_error)
+    return None
+
+
 async def get_voice_client(
     interaction: discord.Interaction, *, connect: bool = True
 ) -> discord.VoiceClient | None:
@@ -175,15 +223,29 @@ async def get_voice_client(
     if not isinstance(channel, (discord.VoiceChannel, discord.StageChannel)):
         await ephemeral(interaction, "Join a voice channel first.")
         return None
-    if client and client.channel != channel:
-        if not interaction.response.is_done():
-            await interaction.response.defer(ephemeral=True)
-        await client.move_to(channel)
-    elif not client:
-        if not interaction.response.is_done():
-            await interaction.response.defer(ephemeral=True)
-        client = await channel.connect(self_deaf=True)
-    return client
+    if not interaction.response.is_done():
+        await interaction.response.defer(ephemeral=True)
+    lock = voice_connect_locks.setdefault(interaction.guild.id, asyncio.Lock())
+    async with lock:
+        client = interaction.guild.voice_client
+        if client and client.is_connected():
+            if client.channel != channel:
+                try:
+                    await client.move_to(channel, timeout=15)
+                except asyncio.TimeoutError:
+                    await clear_voice_session(interaction.guild)
+                    client = await connect_voice_channel(interaction.guild, channel)
+            return client
+        if client:
+            await clear_voice_session(interaction.guild)
+        client = await connect_voice_channel(interaction.guild, channel)
+        if not client:
+            await ephemeral(
+                interaction,
+                "Discord rejected the voice session twice. Wait a few seconds and try "
+                "again; if it continues, check the Pterodactyl node's outbound UDP access.",
+            )
+        return client
 
 
 async def download_image(url: str | None) -> bytes | None:
@@ -2200,7 +2262,11 @@ async def voice_leave(interaction: discord.Interaction) -> None:
         return
     if not client:
         return await ephemeral(interaction, "Response is not connected to voice.")
-    await client.disconnect(force=True)
+    if not interaction.response.is_done():
+        await interaction.response.defer(ephemeral=True)
+    lock = voice_connect_locks.setdefault(interaction.guild_id, asyncio.Lock())
+    async with lock:
+        await clear_voice_session(interaction.guild)
     await ephemeral(interaction, "Disconnected from voice.")
 
 
