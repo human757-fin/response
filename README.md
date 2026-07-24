@@ -177,12 +177,14 @@ considered stopped and Pterodactyl can restart it.
 ### Voice troubleshooting
 
 Discord voice close code `4006` means the voice session is no longer valid.
-Response clears the stale session and retries once with a fresh handshake. Restart
-the Pterodactyl server after updating so the startup command installs the current
-voice dependencies. If both attempts still fail, ask the Pterodactyl node
-administrator to confirm that the container can make outbound UDP connections;
-opening only the web-panel and bot health-check allocations does not provide
-Discord voice transport.
+Response makes one clean handshake attempt, clears a rejected session, and waits
+30 seconds before accepting another attempt so it cannot repeatedly join and
+leave the channel. Restart the Pterodactyl server after updating so the startup
+command installs the current voice dependencies. If attempts still fail, first
+check that no other process or server is using the same Discord bot token, then
+ask the Pterodactyl node administrator to confirm that the container can make
+outbound UDP connections. Opening only the web-panel and bot health-check
+allocations does not provide Discord voice transport.
 
 ## Automatic restart after a push
 

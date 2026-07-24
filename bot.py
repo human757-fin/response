@@ -40,6 +40,7 @@ DEV_GUILD_ID = int(os.getenv("DEV_GUILD_ID", "0") or 0)
 SFX_ROOT = store.ROOT / "data" / "sfx"
 SFX_ROOT.mkdir(parents=True, exist_ok=True)
 voice_connect_locks: dict[int, asyncio.Lock] = {}
+voice_retry_after: dict[int, float] = {}
 
 intents = discord.Intents.default()
 intents.members = True
@@ -179,31 +180,26 @@ async def connect_voice_channel(
     guild: discord.Guild,
     channel: discord.VoiceChannel | discord.StageChannel,
 ) -> discord.VoiceClient | None:
-    last_error: Exception | None = None
-    for attempt in range(2):
-        try:
-            client = await channel.connect(
-                timeout=25,
-                reconnect=True,
-                self_deaf=True,
-            )
-            if client.is_connected():
-                return client
-            last_error = RuntimeError("Discord returned a disconnected voice client")
-        except (
-            asyncio.TimeoutError,
-            discord.ConnectionClosed,
-            discord.ClientException,
-        ) as exc:
-            last_error = exc
-        log.warning(
-            "Voice connection attempt %s failed in guild %s: %s",
-            attempt + 1,
-            guild.id,
-            last_error,
+    try:
+        # discord.py's initial reconnect loop repeatedly toggles the bot's voice
+        # state when Discord rejects a session. Fail once and leave retry timing
+        # to Response so a bad session cannot make the bot flap in the channel.
+        client = await channel.connect(
+            timeout=20,
+            reconnect=False,
+            self_deaf=True,
         )
-        await clear_voice_session(guild)
-    log.error("Could not establish a fresh voice session in guild %s: %s", guild.id, last_error)
+        if client.is_connected():
+            return client
+        error: Exception = RuntimeError("Discord returned a disconnected voice client")
+    except (
+        asyncio.TimeoutError,
+        discord.ConnectionClosed,
+        discord.ClientException,
+    ) as exc:
+        error = exc
+    log.error("Voice connection failed in guild %s: %s", guild.id, error)
+    await clear_voice_session(guild)
     return None
 
 
@@ -230,6 +226,7 @@ async def get_voice_client(
     async with lock:
         client = interaction.guild.voice_client
         if client and client.is_connected():
+            voice_retry_after.pop(interaction.guild.id, None)
             if client.channel != channel:
                 try:
                     await client.move_to(channel, timeout=15)
@@ -239,13 +236,25 @@ async def get_voice_client(
             return client
         if client:
             await clear_voice_session(interaction.guild)
-        client = await connect_voice_channel(interaction.guild, channel)
-        if not client:
+        retry_in = voice_retry_after.get(interaction.guild.id, 0) - time.monotonic()
+        if retry_in > 0:
             await ephemeral(
                 interaction,
-                "Discord rejected the voice session twice. Wait a few seconds and try "
-                "again; if it continues, check the Pterodactyl node's outbound UDP access.",
+                f"Voice is cooling down after a rejected session. Try again in "
+                f"**{int(retry_in) + 1}s**.",
             )
+            return None
+        client = await connect_voice_channel(interaction.guild, channel)
+        if not client:
+            voice_retry_after[interaction.guild.id] = time.monotonic() + 30
+            await ephemeral(
+                interaction,
+                "Discord rejected the voice session. Response stopped reconnecting to "
+                "prevent join/leave spam. Try again in 30 seconds; if it continues, "
+                "check for another bot instance using the same token.",
+            )
+        else:
+            voice_retry_after.pop(interaction.guild.id, None)
         return client
 
 
