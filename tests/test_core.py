@@ -12,6 +12,16 @@ class StoreTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.tempdir = tempfile.TemporaryDirectory()
+        for name in (
+            "DATABASE_URL",
+            "DATABASE_ENGINE",
+            "DB_HOST",
+            "DB_PORT",
+            "DB_NAME",
+            "DB_USER",
+            "DB_PASSWORD",
+        ):
+            os.environ.pop(name, None)
         os.environ["DATABASE_PATH"] = str(Path(cls.tempdir.name) / "test.db")
         import response_core
 
@@ -105,6 +115,52 @@ class StoreTests(unittest.TestCase):
         with self.store.connect() as db:
             row = db.execute("SELECT * FROM giveaway_entries WHERE message_id=1").fetchone()
         self.assertEqual(json.loads(json.dumps(dict(row)))["entries"], 4)
+
+    def test_mysql_adapter_translates_placeholders(self) -> None:
+        calls = []
+
+        class FakeCursor:
+            def execute(self, query, parameters):
+                calls.append((query, parameters))
+
+        class FakeConnection:
+            def cursor(self):
+                return FakeCursor()
+
+        database = self.store.Database(FakeConnection(), mysql=True)
+        database.execute("SELECT * FROM members WHERE guild_id=? AND user_id=?", (1, 2))
+
+        self.assertEqual(
+            calls,
+            [("SELECT * FROM members WHERE guild_id=%s AND user_id=%s", (1, 2))],
+        )
+
+    def test_mysql_endpoint_and_schema_configuration(self) -> None:
+        old_url = self.store.DATABASE_URL
+        try:
+            self.store.DATABASE_URL = ""
+            os.environ.update(
+                {
+                    "DB_HOST": "database.internal:3307",
+                    "DB_NAME": "s12_response",
+                    "DB_USER": "u12_response",
+                    "DB_PASSWORD": "secret",
+                }
+            )
+            os.environ.pop("DB_PORT", None)
+            settings = self.store._mysql_settings()
+        finally:
+            self.store.DATABASE_URL = old_url
+            for name in ("DB_HOST", "DB_NAME", "DB_USER", "DB_PASSWORD"):
+                os.environ.pop(name, None)
+
+        self.assertEqual(settings["host"], "database.internal")
+        self.assertEqual(settings["port"], 3307)
+        self.assertEqual(settings["database"], "s12_response")
+        schema = "\n".join(self.store.MYSQL_SCHEMA)
+        self.assertIn("AUTO_INCREMENT", schema)
+        self.assertIn("ENGINE=InnoDB", schema)
+        self.assertNotIn("AUTOINCREMENT", schema)
 
 
 if __name__ == "__main__":

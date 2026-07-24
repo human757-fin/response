@@ -7,14 +7,25 @@ import math
 import os
 import secrets
 import sqlite3
+import threading
 import time
 from copy import deepcopy
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
+from urllib.parse import unquote, urlparse
 
 ROOT = Path(__file__).resolve().parent
 DATABASE_PATH = Path(os.getenv("DATABASE_PATH", ROOT / "response.db"))
+DATABASE_URL = os.getenv("DATABASE_URL", "")
+DATABASE_ENGINE = os.getenv("DATABASE_ENGINE", "").lower()
+USE_MYSQL = (
+    DATABASE_URL.startswith(("mysql://", "mariadb://", "mysql+pymysql://"))
+    or DATABASE_ENGINE in {"mysql", "mariadb"}
+    or bool(os.getenv("DB_HOST"))
+)
+_MYSQL_CONNECTION: Any = None
+_MYSQL_LOCK = threading.RLock()
 
 
 DEFAULT_CONFIG: dict[str, Any] = {
@@ -121,94 +132,284 @@ def normalize_config(config: dict[str, Any] | None) -> dict[str, Any]:
     return _merge(DEFAULT_CONFIG, config or {})
 
 
+class Database:
+    """Small compatibility layer for SQLite and PyMySQL connections."""
+
+    def __init__(self, connection: Any, mysql: bool) -> None:
+        self.connection = connection
+        self.mysql = mysql
+
+    def execute(self, query: str, parameters: tuple[Any, ...] = ()) -> Any:
+        if self.mysql:
+            cursor = self.connection.cursor()
+            cursor.execute(query.replace("?", "%s"), parameters)
+            return cursor
+        return self.connection.execute(query, parameters)
+
+    def executescript(self, script: str) -> None:
+        if self.mysql:
+            for statement in script.split(";"):
+                if statement.strip():
+                    self.execute(statement)
+            return
+        self.connection.executescript(script)
+
+
+def database_backend() -> str:
+    return "mysql" if USE_MYSQL else "sqlite"
+
+
+def dialect(sqlite_query: str, mysql_query: str) -> str:
+    return mysql_query if USE_MYSQL else sqlite_query
+
+
+def _mysql_settings() -> dict[str, Any]:
+    if DATABASE_URL:
+        parsed = urlparse(DATABASE_URL.replace("mysql+pymysql://", "mysql://", 1))
+        if not parsed.hostname or not parsed.username or not parsed.path.lstrip("/"):
+            raise RuntimeError("DATABASE_URL must contain a host, username, and database name")
+        return {
+            "host": parsed.hostname,
+            "port": parsed.port or 3306,
+            "user": unquote(parsed.username),
+            "password": unquote(parsed.password or ""),
+            "database": unquote(parsed.path.lstrip("/")),
+        }
+    missing = [
+        name
+        for name in ("DB_HOST", "DB_USER", "DB_PASSWORD", "DB_NAME")
+        if not os.getenv(name)
+    ]
+    if missing:
+        raise RuntimeError(
+            "MySQL is enabled but these variables are missing: " + ", ".join(missing)
+        )
+    host = os.environ["DB_HOST"]
+    port = int(os.getenv("DB_PORT", "3306"))
+    if host.count(":") == 1 and not os.getenv("DB_PORT"):
+        host, raw_port = host.rsplit(":", 1)
+        if raw_port.isdigit():
+            port = int(raw_port)
+    return {
+        "host": host,
+        "port": port,
+        "user": os.environ["DB_USER"],
+        "password": os.environ["DB_PASSWORD"],
+        "database": os.environ["DB_NAME"],
+    }
+
+
+def _get_mysql_connection() -> Any:
+    global _MYSQL_CONNECTION
+    import pymysql
+
+    if _MYSQL_CONNECTION is None:
+        settings = _mysql_settings()
+        _MYSQL_CONNECTION = pymysql.connect(
+            **settings,
+            charset="utf8mb4",
+            autocommit=False,
+            connect_timeout=10,
+            read_timeout=30,
+            write_timeout=30,
+            cursorclass=pymysql.cursors.DictCursor,
+            ssl={} if os.getenv("DB_SSL", "0") == "1" else None,
+        )
+    else:
+        _MYSQL_CONNECTION.ping(reconnect=True)
+    return _MYSQL_CONNECTION
+
+
 @contextmanager
-def connect() -> Iterator[sqlite3.Connection]:
-    DATABASE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    db = sqlite3.connect(DATABASE_PATH, timeout=15)
-    db.row_factory = sqlite3.Row
-    db.execute("PRAGMA journal_mode=WAL")
-    db.execute("PRAGMA foreign_keys=ON")
-    try:
-        yield db
-        db.commit()
-    finally:
-        db.close()
+def connect() -> Iterator[Database]:
+    lock = _MYSQL_LOCK if USE_MYSQL else threading.RLock()
+    with lock:
+        if USE_MYSQL:
+            connection = _get_mysql_connection()
+        else:
+            DATABASE_PATH.parent.mkdir(parents=True, exist_ok=True)
+            connection = sqlite3.connect(DATABASE_PATH, timeout=15)
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA journal_mode=WAL")
+            connection.execute("PRAGMA foreign_keys=ON")
+        db = Database(connection, USE_MYSQL)
+        try:
+            yield db
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            if not USE_MYSQL:
+                connection.close()
+
+
+MYSQL_SCHEMA = (
+    """
+    CREATE TABLE IF NOT EXISTS guilds (
+        guild_id BIGINT UNSIGNED PRIMARY KEY,
+        name VARCHAR(255) NOT NULL DEFAULT 'Unknown server',
+        config LONGTEXT NOT NULL,
+        updated_at BIGINT NOT NULL
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS members (
+        guild_id BIGINT UNSIGNED NOT NULL,
+        user_id BIGINT UNSIGNED NOT NULL,
+        username VARCHAR(255) NOT NULL DEFAULT 'Unknown user',
+        xp BIGINT NOT NULL DEFAULT 0,
+        level INT NOT NULL DEFAULT 0,
+        balance BIGINT NOT NULL DEFAULT 0,
+        last_message_xp BIGINT NOT NULL DEFAULT 0,
+        last_reaction_xp BIGINT NOT NULL DEFAULT 0,
+        last_work BIGINT NOT NULL DEFAULT 0,
+        last_daily BIGINT NOT NULL DEFAULT 0,
+        last_weekly BIGINT NOT NULL DEFAULT 0,
+        PRIMARY KEY (guild_id, user_id),
+        KEY members_leaderboard (guild_id, xp)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS reaction_roles (
+        guild_id BIGINT UNSIGNED NOT NULL,
+        message_id BIGINT UNSIGNED NOT NULL,
+        emoji VARCHAR(191) NOT NULL,
+        role_id BIGINT UNSIGNED NOT NULL,
+        PRIMARY KEY (guild_id, message_id, emoji)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS giveaways (
+        message_id BIGINT UNSIGNED PRIMARY KEY,
+        guild_id BIGINT UNSIGNED NOT NULL,
+        channel_id BIGINT UNSIGNED NOT NULL,
+        prize TEXT NOT NULL,
+        winner_count INT NOT NULL,
+        ends_at BIGINT NOT NULL,
+        status VARCHAR(16) NOT NULL DEFAULT 'active',
+        winners LONGTEXT NOT NULL,
+        created_by BIGINT UNSIGNED NOT NULL,
+        KEY giveaways_due (status, ends_at),
+        KEY giveaways_guild (guild_id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS giveaway_entries (
+        message_id BIGINT UNSIGNED NOT NULL,
+        user_id BIGINT UNSIGNED NOT NULL,
+        username VARCHAR(255) NOT NULL,
+        entries INT NOT NULL DEFAULT 1,
+        PRIMARY KEY (message_id, user_id),
+        CONSTRAINT response_giveaway_entries_fk FOREIGN KEY (message_id)
+            REFERENCES giveaways(message_id) ON DELETE CASCADE
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS scheduled_messages (
+        id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+        guild_id BIGINT UNSIGNED NOT NULL,
+        channel_id BIGINT UNSIGNED NOT NULL,
+        content TEXT NOT NULL,
+        embed_json LONGTEXT NULL,
+        send_at BIGINT NOT NULL,
+        repeat_seconds BIGINT NOT NULL DEFAULT 0,
+        last_sent BIGINT NULL,
+        enabled TINYINT(1) NOT NULL DEFAULT 1,
+        KEY schedules_due (enabled, send_at),
+        KEY schedules_guild (guild_id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS audit_events (
+        id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+        guild_id BIGINT UNSIGNED NOT NULL,
+        event_type VARCHAR(100) NOT NULL,
+        detail TEXT NOT NULL,
+        created_at BIGINT NOT NULL,
+        KEY audit_guild (guild_id, id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+    """,
+)
+
+
+SQLITE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS guilds (
+    guild_id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL DEFAULT 'Unknown server',
+    config TEXT NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS members (
+    guild_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    username TEXT NOT NULL DEFAULT 'Unknown user',
+    xp INTEGER NOT NULL DEFAULT 0,
+    level INTEGER NOT NULL DEFAULT 0,
+    balance INTEGER NOT NULL DEFAULT 0,
+    last_message_xp INTEGER NOT NULL DEFAULT 0,
+    last_reaction_xp INTEGER NOT NULL DEFAULT 0,
+    last_work INTEGER NOT NULL DEFAULT 0,
+    last_daily INTEGER NOT NULL DEFAULT 0,
+    last_weekly INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (guild_id, user_id)
+);
+CREATE TABLE IF NOT EXISTS reaction_roles (
+    guild_id INTEGER NOT NULL,
+    message_id INTEGER NOT NULL,
+    emoji TEXT NOT NULL,
+    role_id INTEGER NOT NULL,
+    PRIMARY KEY (guild_id, message_id, emoji)
+);
+CREATE TABLE IF NOT EXISTS giveaways (
+    message_id INTEGER PRIMARY KEY,
+    guild_id INTEGER NOT NULL,
+    channel_id INTEGER NOT NULL,
+    prize TEXT NOT NULL,
+    winner_count INTEGER NOT NULL,
+    ends_at INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active',
+    winners TEXT NOT NULL DEFAULT '[]',
+    created_by INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS giveaway_entries (
+    message_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    username TEXT NOT NULL,
+    entries INTEGER NOT NULL DEFAULT 1,
+    PRIMARY KEY (message_id, user_id),
+    FOREIGN KEY (message_id) REFERENCES giveaways(message_id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS scheduled_messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_id INTEGER NOT NULL,
+    channel_id INTEGER NOT NULL,
+    content TEXT NOT NULL DEFAULT '',
+    embed_json TEXT,
+    send_at INTEGER NOT NULL,
+    repeat_seconds INTEGER NOT NULL DEFAULT 0,
+    last_sent INTEGER,
+    enabled INTEGER NOT NULL DEFAULT 1
+);
+CREATE TABLE IF NOT EXISTS audit_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_id INTEGER NOT NULL,
+    event_type TEXT NOT NULL,
+    detail TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS members_leaderboard ON members(guild_id, xp DESC);
+CREATE INDEX IF NOT EXISTS schedules_due ON scheduled_messages(enabled, send_at);
+"""
 
 
 def init_db() -> None:
     with connect() as db:
-        db.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS guilds (
-                guild_id INTEGER PRIMARY KEY,
-                name TEXT NOT NULL DEFAULT 'Unknown server',
-                config TEXT NOT NULL,
-                updated_at INTEGER NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS members (
-                guild_id INTEGER NOT NULL,
-                user_id INTEGER NOT NULL,
-                username TEXT NOT NULL DEFAULT 'Unknown user',
-                xp INTEGER NOT NULL DEFAULT 0,
-                level INTEGER NOT NULL DEFAULT 0,
-                balance INTEGER NOT NULL DEFAULT 0,
-                last_message_xp INTEGER NOT NULL DEFAULT 0,
-                last_reaction_xp INTEGER NOT NULL DEFAULT 0,
-                last_work INTEGER NOT NULL DEFAULT 0,
-                last_daily INTEGER NOT NULL DEFAULT 0,
-                last_weekly INTEGER NOT NULL DEFAULT 0,
-                PRIMARY KEY (guild_id, user_id)
-            );
-            CREATE TABLE IF NOT EXISTS reaction_roles (
-                guild_id INTEGER NOT NULL,
-                message_id INTEGER NOT NULL,
-                emoji TEXT NOT NULL,
-                role_id INTEGER NOT NULL,
-                PRIMARY KEY (guild_id, message_id, emoji)
-            );
-            CREATE TABLE IF NOT EXISTS giveaways (
-                message_id INTEGER PRIMARY KEY,
-                guild_id INTEGER NOT NULL,
-                channel_id INTEGER NOT NULL,
-                prize TEXT NOT NULL,
-                winner_count INTEGER NOT NULL,
-                ends_at INTEGER NOT NULL,
-                status TEXT NOT NULL DEFAULT 'active',
-                winners TEXT NOT NULL DEFAULT '[]',
-                created_by INTEGER NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS giveaway_entries (
-                message_id INTEGER NOT NULL,
-                user_id INTEGER NOT NULL,
-                username TEXT NOT NULL,
-                entries INTEGER NOT NULL DEFAULT 1,
-                PRIMARY KEY (message_id, user_id),
-                FOREIGN KEY (message_id) REFERENCES giveaways(message_id) ON DELETE CASCADE
-            );
-            CREATE TABLE IF NOT EXISTS scheduled_messages (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                guild_id INTEGER NOT NULL,
-                channel_id INTEGER NOT NULL,
-                content TEXT NOT NULL DEFAULT '',
-                embed_json TEXT,
-                send_at INTEGER NOT NULL,
-                repeat_seconds INTEGER NOT NULL DEFAULT 0,
-                last_sent INTEGER,
-                enabled INTEGER NOT NULL DEFAULT 1
-            );
-            CREATE TABLE IF NOT EXISTS audit_events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                guild_id INTEGER NOT NULL,
-                event_type TEXT NOT NULL,
-                detail TEXT NOT NULL,
-                created_at INTEGER NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS members_leaderboard
-                ON members(guild_id, xp DESC);
-            CREATE INDEX IF NOT EXISTS schedules_due
-                ON scheduled_messages(enabled, send_at);
-            """
-        )
+        if USE_MYSQL:
+            for statement in MYSQL_SCHEMA:
+                db.execute(statement)
+        else:
+            db.executescript(SQLITE_SCHEMA)
 
 
 def ensure_guild(guild_id: int, name: str = "Unknown server") -> dict[str, Any]:
@@ -244,10 +445,17 @@ def save_config(guild_id: int, config: dict[str, Any]) -> dict[str, Any]:
         existing = db.execute("SELECT name FROM guilds WHERE guild_id = ?", (guild_id,)).fetchone()
         name = existing["name"] if existing else "Unknown server"
         db.execute(
-            """
-            INSERT INTO guilds(guild_id, name, config, updated_at) VALUES (?, ?, ?, ?)
-            ON CONFLICT(guild_id) DO UPDATE SET config=excluded.config, updated_at=excluded.updated_at
-            """,
+            dialect(
+                """
+                INSERT INTO guilds(guild_id, name, config, updated_at) VALUES (?, ?, ?, ?)
+                ON CONFLICT(guild_id) DO UPDATE
+                    SET config=excluded.config, updated_at=excluded.updated_at
+                """,
+                """
+                INSERT INTO guilds(guild_id, name, config, updated_at) VALUES (?, ?, ?, ?)
+                ON DUPLICATE KEY UPDATE config=VALUES(config), updated_at=VALUES(updated_at)
+                """,
+            ),
             (guild_id, name, json.dumps(clean), int(time.time())),
         )
     return clean
@@ -262,18 +470,24 @@ def list_guilds() -> list[dict[str, Any]]:
                    COALESCE(SUM(m.xp), 0) AS total_xp,
                    COALESCE(SUM(m.balance), 0) AS economy_total
             FROM guilds g LEFT JOIN members m ON m.guild_id = g.guild_id
-            GROUP BY g.guild_id ORDER BY g.name
+            GROUP BY g.guild_id, g.name, g.updated_at ORDER BY g.name
             """
         ).fetchall()
     return [dict(row) for row in rows]
 
 
-def _member(guild_id: int, user_id: int, username: str, db: sqlite3.Connection) -> sqlite3.Row:
+def _member(guild_id: int, user_id: int, username: str, db: Database) -> Any:
     db.execute(
-        """
-        INSERT INTO members(guild_id, user_id, username) VALUES (?, ?, ?)
-        ON CONFLICT(guild_id, user_id) DO UPDATE SET username=excluded.username
-        """,
+        dialect(
+            """
+            INSERT INTO members(guild_id, user_id, username) VALUES (?, ?, ?)
+            ON CONFLICT(guild_id, user_id) DO UPDATE SET username=excluded.username
+            """,
+            """
+            INSERT INTO members(guild_id, user_id, username) VALUES (?, ?, ?)
+            ON DUPLICATE KEY UPDATE username=VALUES(username)
+            """,
+        ),
         (guild_id, user_id, username),
     )
     return db.execute(

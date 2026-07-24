@@ -12,8 +12,9 @@ giveaways.
 | Discord bot and health API | `bot.py` | 2067 |
 | Management web panel | `webpanel.py` | 2040 |
 
-Both processes use `response.db`, a SQLite database in WAL mode. Giveaway state,
-entries, XP, balances, and scheduled messages survive restarts.
+Both processes use the same MySQL/MariaDB database in production. SQLite remains
+available as a zero-configuration local fallback. Giveaway state, entries, XP,
+balances, and scheduled messages survive restarts.
 
 ## Discord setup
 
@@ -51,6 +52,17 @@ Configure these Pterodactyl variables:
 | `WEB_PORT` | `2040` |
 | `BOT_PORT` | `2067` |
 | `PY_PACKAGES` | Leave empty |
+| `DATABASE_ENGINE` | `mysql` |
+| `DB_HOST` | Database endpoint/host from Pterodactyl |
+| `DB_PORT` | Database port, normally `3306` |
+| `DB_NAME` | Database name from Pterodactyl |
+| `DB_USER` | Database username from Pterodactyl |
+| `DB_PASSWORD` | Database password from Pterodactyl |
+| `DB_SSL` | `0`, unless the database provider requires TLS |
+
+Pterodactyl sometimes displays its database endpoint as `host:port`; Response
+accepts that entire value in `DB_HOST` when `DB_PORT` is left unset. The schema is
+created automatically on first startup. Never commit the database password.
 
 Allocate and expose ports **2040** and **2067** to the server. If TLS terminates at
 a reverse proxy, set `WEBUI_SECURE_COOKIE=1`. The panel deliberately warns and

@@ -283,6 +283,7 @@ async def health(_: web.Request) -> web.Response:
             "status": "ok",
             "port": WEB_PORT,
             "authentication": "enabled" if WEBUI_PASSWORD else "disabled",
+            "database": store.database_backend(),
         }
     )
 

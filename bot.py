@@ -130,12 +130,20 @@ class GiveawayView(discord.ui.View):
                     "This giveaway has ended.", ephemeral=True
                 )
             db.execute(
-                """
-                INSERT INTO giveaway_entries(message_id, user_id, username, entries)
-                VALUES (?, ?, ?, ?)
-                ON CONFLICT(message_id, user_id)
-                DO UPDATE SET username=excluded.username, entries=excluded.entries
-                """,
+                store.dialect(
+                    """
+                    INSERT INTO giveaway_entries(message_id, user_id, username, entries)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(message_id, user_id)
+                    DO UPDATE SET username=excluded.username, entries=excluded.entries
+                    """,
+                    """
+                    INSERT INTO giveaway_entries(message_id, user_id, username, entries)
+                    VALUES (?, ?, ?, ?)
+                    ON DUPLICATE KEY UPDATE
+                        username=VALUES(username), entries=VALUES(entries)
+                    """,
+                ),
                 (interaction.message.id, interaction.user.id, str(interaction.user), entries),
             )
         await interaction.response.send_message(
@@ -246,6 +254,7 @@ class ResponseBot(commands.Bot):
                     "guilds": len(self.guilds),
                     "latency_ms": round(self.latency * 1000),
                     "uptime_seconds": round(time.time() - self.started_at),
+                    "database": store.database_backend(),
                 }
             )
 
@@ -974,11 +983,13 @@ async def schedule_embed(
     ).to_dict()
     with store.connect() as db:
         db.execute(
-            "INSERT INTO scheduled_messages(guild_id, channel_id, embed_json, send_at, repeat_seconds) "
-            "VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO scheduled_messages("
+            "guild_id, channel_id, content, embed_json, send_at, repeat_seconds"
+            ") VALUES (?, ?, ?, ?, ?, ?)",
             (
                 interaction.guild_id,
                 channel.id,
+                "",
                 json.dumps(scheduled_embed),
                 int(time.time()) + minutes_from_now * 60,
                 repeat_minutes * 60,
@@ -1016,10 +1027,21 @@ async def giveaway(
     with store.connect() as db:
         db.execute(
             """
-            INSERT INTO giveaways(message_id, guild_id, channel_id, prize, winner_count, ends_at, created_by)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO giveaways(
+                message_id, guild_id, channel_id, prize, winner_count, ends_at, winners, created_by
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (message.id, interaction.guild_id, interaction.channel_id, prize, winners, ends_at, interaction.user.id),
+            (
+                message.id,
+                interaction.guild_id,
+                interaction.channel_id,
+                prize,
+                winners,
+                ends_at,
+                "[]",
+                interaction.user.id,
+            ),
         )
     await interaction.followup.send(f"Giveaway created: {message.jump_url}", ephemeral=True)
 
@@ -1046,8 +1068,15 @@ async def reaction_role(
         return await interaction.response.send_message("Provide a numeric message ID.", ephemeral=True)
     with store.connect() as db:
         db.execute(
-            "INSERT OR REPLACE INTO reaction_roles(guild_id, message_id, emoji, role_id) "
-            "VALUES (?, ?, ?, ?)",
+            store.dialect(
+                "INSERT OR REPLACE INTO reaction_roles(guild_id, message_id, emoji, role_id) "
+                "VALUES (?, ?, ?, ?)",
+                """
+                INSERT INTO reaction_roles(guild_id, message_id, emoji, role_id)
+                VALUES (?, ?, ?, ?)
+                ON DUPLICATE KEY UPDATE role_id=VALUES(role_id)
+                """,
+            ),
             (interaction.guild_id, int(message_id), emoji, role.id),
         )
     try:
