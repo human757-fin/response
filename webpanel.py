@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hmac
+import ipaddress
 import json
 import logging
 import os
@@ -25,6 +26,7 @@ log = logging.getLogger("response.web")
 WEB_PORT = int(os.getenv("WEB_PORT", "2040"))
 WEBUI_PASSWORD = os.getenv("WEBUI_PASSWORD", "")
 COOKIE_SECURE = os.getenv("WEBUI_SECURE_COOKIE", "0") == "1"
+TRUST_PROXY = os.getenv("WEBUI_TRUST_PROXY", "0") == "1"
 SESSIONS: dict[str, float] = {}
 SESSION_TTL = 7 * 86400
 SFX_ROOT = store.ROOT / "data" / "sfx"
@@ -371,10 +373,51 @@ def authenticated(request: web.Request) -> bool:
     return True
 
 
+def client_ip(request: web.Request) -> str:
+    candidates: list[str] = []
+    if TRUST_PROXY:
+        candidates.extend(
+            (
+                request.headers.get("X-Forwarded-For", "").split(",", 1)[0],
+                request.headers.get("X-Real-IP", ""),
+            )
+        )
+    candidates.append(request.remote or "")
+    for candidate in candidates:
+        try:
+            return ipaddress.ip_address(candidate.strip()).compressed
+        except ValueError:
+            continue
+    return "unknown"
+
+
+@web.middleware
+async def access_log_middleware(request: web.Request, handler: Any) -> web.StreamResponse:
+    started = time.monotonic()
+    status = 500
+    try:
+        response = await handler(request)
+        status = response.status
+        return response
+    except web.HTTPException as exc:
+        status = exc.status
+        raise
+    finally:
+        log.info(
+            "Web request from %s: %s %s -> %s (%.1f ms)",
+            client_ip(request),
+            request.method,
+            request.path,
+            status,
+            (time.monotonic() - started) * 1000,
+        )
+
+
 @web.middleware
 async def auth_middleware(request: web.Request, handler: Any) -> web.StreamResponse:
     public = request.path in {"/", "/health", "/api/login"}
     if not public and not authenticated(request):
+        log.warning("Rejected unauthorized web request from %s to %s", client_ip(request), request.path)
         return json_response({"error": "Unauthorized"}, 401)
     return await handler(request)
 
@@ -397,15 +440,19 @@ async def health(_: web.Request) -> web.Response:
 
 async def login(request: web.Request) -> web.Response:
     if not WEBUI_PASSWORD:
+        log.warning("Web login from %s while authentication is disabled", client_ip(request))
         return json_response({"ok": True, "authentication": "disabled"})
     try:
         body = await request.json()
     except json.JSONDecodeError:
+        log.warning("Invalid web login request from %s", client_ip(request))
         return json_response({"error": "Invalid request"}, 400)
     if not hmac.compare_digest(str(body.get("password", "")), WEBUI_PASSWORD):
+        log.warning("Failed web login from %s", client_ip(request))
         return json_response({"error": "Incorrect password"}, 401)
     token = store.create_session()
     SESSIONS[token] = time.time() + SESSION_TTL
+    log.info("Successful web login from %s", client_ip(request))
     response = json_response({"ok": True})
     response.set_cookie(
         "response_session",
@@ -429,7 +476,12 @@ def guild_id(request: web.Request) -> int:
         raise web.HTTPBadRequest(text="Invalid guild ID") from exc
 
 
-def record_panel_event(target: int, event_type: str, detail: str) -> None:
+def record_panel_event(
+    request: web.Request,
+    target: int,
+    event_type: str,
+    detail: str,
+) -> None:
     config = store.get_config(target)["logs"]
     if not config["enabled"]:
         return
@@ -437,7 +489,7 @@ def record_panel_event(target: int, event_type: str, detail: str) -> None:
         retention = int(config.get("web_history_limit", 10000))
     except (TypeError, ValueError):
         retention = 10000
-    store.add_event_log(target, event_type, detail, retention)
+    store.add_event_log(target, event_type, f"{detail}\nIP address: `{client_ip(request)}`", retention)
 
 
 async def config_get(request: web.Request) -> web.Response:
@@ -452,8 +504,13 @@ async def config_put(request: web.Request) -> web.Response:
     if not isinstance(config, dict):
         return json_response({"error": "Configuration must be an object"}, 400)
     saved = store.save_config(guild_id(request), config)
-    store.add_audit(guild_id(request), "settings_updated", "Configuration changed in web panel")
+    store.add_audit(
+        guild_id(request),
+        "settings_updated",
+        f"Configuration changed in web panel from IP {client_ip(request)}",
+    )
     record_panel_event(
+        request,
         guild_id(request),
         "Web panel settings saved",
         "The server configuration was changed by an authenticated web panel session.",
@@ -570,8 +627,13 @@ async def sound_effect_create(request: web.Request) -> web.Response:
         store.save_sound_effect(target, name, source_type, source, 0, volume)
         if previous and previous.get("source") != source:
             remove_sound_file(previous)
-        store.add_audit(target, "sfx_saved", f"Saved sound effect: {name}")
+        store.add_audit(
+            target,
+            "sfx_saved",
+            f"Saved sound effect: {name} from IP {client_ip(request)}",
+        )
         record_panel_event(
+            request,
             target,
             "Web panel sound effect saved",
             f"Sound effect `{name}` was saved from a {source_type} source.",
@@ -599,6 +661,7 @@ async def sound_effect_delete(request: web.Request) -> web.Response:
         return json_response({"error": "Sound effect not found"}, 404)
     remove_sound_file(sound)
     record_panel_event(
+        request,
         target,
         "Web panel sound effect deleted",
         f"Sound-effect record `{sound_id}` was deleted.",
@@ -666,6 +729,7 @@ async def schedule_create(request: web.Request) -> web.Response:
         )
         schedule_id = cursor.lastrowid
     record_panel_event(
+        request,
         target,
         "Web panel message scheduled",
         f"Scheduled message `{schedule_id}` for channel `{channel_id}` in {minutes} minute(s).",
@@ -688,6 +752,7 @@ async def schedule_delete(request: web.Request) -> web.Response:
     if not cursor.rowcount:
         return json_response({"error": "Schedule not found"}, 404)
     record_panel_event(
+        request,
         int(row["guild_id"]),
         "Web panel schedule deleted",
         f"Scheduled message `{schedule_id}` was deleted.",
@@ -696,7 +761,10 @@ async def schedule_delete(request: web.Request) -> web.Response:
 
 
 def create_app() -> web.Application:
-    app = web.Application(middlewares=[auth_middleware], client_max_size=32 * 1024 * 1024)
+    app = web.Application(
+        middlewares=[access_log_middleware, auth_middleware],
+        client_max_size=32 * 1024 * 1024,
+    )
     app.router.add_get("/", index)
     app.router.add_get("/health", health)
     app.router.add_post("/api/login", login)

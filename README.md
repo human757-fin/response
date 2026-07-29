@@ -150,6 +150,7 @@ Configure these Pterodactyl variables:
 | `AUTO_UPDATE` | `1` |
 | `DISCORD_TOKEN` | Discord bot token |
 | `WEBUI_PASSWORD` | A long, unique panel password |
+| `WEBUI_TRUST_PROXY` | `0`; use `1` only behind a trusted reverse proxy |
 | `WEB_PORT` | `2040` |
 | `BOT_PORT` | `2067` |
 | `PY_PACKAGES` | Leave empty |
@@ -169,6 +170,13 @@ Allocate and expose ports **2040** and **2067** to the server. If TLS terminates
 a reverse proxy, set `WEBUI_SECURE_COOKIE=1`. The panel deliberately warns and
 runs without authentication if `WEBUI_PASSWORD` is empty, which is only
 appropriate for local development.
+
+Every Web UI request and login attempt is written to the process log with its IP
+address. Persistent Web UI mutation events also include the IP address on the
+**Event logs** page when server logging is enabled. Leave `WEBUI_TRUST_PROXY=0`
+when connecting directly. Set it to `1` only when a trusted reverse proxy
+overwrites `X-Forwarded-For` or `X-Real-IP`; otherwise clients could spoof the
+logged address.
 
 The startup line launches `webpanel.py` in the background and keeps `bot.py` as
 the Pterodactyl-managed foreground process. If the bot exits, the server is
