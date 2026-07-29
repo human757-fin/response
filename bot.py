@@ -327,25 +327,22 @@ class GiveawayView(discord.ui.View):
                 return await interaction.response.send_message(
                     "This giveaway has ended.", ephemeral=True
                 )
-            db.execute(
-                store.dialect(
-                    """
-                    INSERT INTO giveaway_entries(message_id, user_id, username, entries)
-                    VALUES (?, ?, ?, ?)
-                    ON CONFLICT(message_id, user_id)
-                    DO UPDATE SET username=excluded.username, entries=excluded.entries
-                    """,
-                    """
-                    INSERT INTO giveaway_entries(message_id, user_id, username, entries)
-                    VALUES (?, ?, ?, ?)
-                    ON DUPLICATE KEY UPDATE
-                        username=VALUES(username), entries=VALUES(entries)
-                    """,
-                ),
-                (interaction.message.id, interaction.user.id, str(interaction.user), entries),
+        entered, saved_entries = store.enter_giveaway(
+            interaction.message.id,
+            interaction.user.id,
+            str(interaction.user),
+            entries,
+        )
+        if not entered:
+            return await interaction.response.send_message(
+                f"You already entered this giveaway with **{saved_entries}** "
+                f"entr{'y' if saved_entries == 1 else 'ies'}.",
+                ephemeral=True,
             )
         await interaction.response.send_message(
-            f"You entered with **{entries}** entr{'y' if entries == 1 else 'ies'}.", ephemeral=True
+            f"You entered with **{saved_entries}** "
+            f"entr{'y' if saved_entries == 1 else 'ies'}.",
+            ephemeral=True,
         )
 
 
@@ -1503,14 +1500,21 @@ async def finish_giveaway(message_id: int) -> list[int]:
         if not giveaway or giveaway["status"] != "active":
             return []
         entries = db.execute(
-            "SELECT user_id, entries FROM giveaway_entries WHERE message_id=?", (message_id,)
+            "SELECT user_id, username, entries FROM giveaway_entries WHERE message_id=?",
+            (message_id,),
         ).fetchall()
-        pool = [int(row["user_id"]) for row in entries for _ in range(int(row["entries"]))]
+        entry_counts = {int(row["user_id"]): int(row["entries"]) for row in entries}
+        remaining = dict(entry_counts)
         winners: list[int] = []
-        while pool and len(winners) < int(giveaway["winner_count"]):
-            winner = random.choice(pool)
+        while remaining and len(winners) < int(giveaway["winner_count"]):
+            user_ids = list(remaining)
+            winner = random.choices(
+                user_ids,
+                weights=[max(1, remaining[user_id]) for user_id in user_ids],
+                k=1,
+            )[0]
             winners.append(winner)
-            pool = [user_id for user_id in pool if user_id != winner]
+            remaining.pop(winner)
         db.execute(
             "UPDATE giveaways SET status='ended', winners=? WHERE message_id=?",
             (json.dumps(winners), message_id),
@@ -1518,11 +1522,35 @@ async def finish_giveaway(message_id: int) -> list[int]:
         data = dict(giveaway)
     channel = bot.get_channel(int(data["channel_id"]))
     if isinstance(channel, discord.TextChannel):
-        mentions = ", ".join(f"<@{winner}>" for winner in winners) or "No valid entries"
-        await channel.send(f"🎉 **{data['prize']}** winner(s): {mentions}")
+        winner_lines = [
+            f"<@{winner}> — **{entry_counts[winner]}** "
+            f"entr{'y' if entry_counts[winner] == 1 else 'ies'}"
+            for winner in winners
+        ]
+        result = "\n".join(winner_lines) if winner_lines else "No valid entries."
+        ended_at = int(time.time())
+        result_embed = discord.Embed(
+            title="🎉 Giveaway ended",
+            description=f"**Prize:** {data['prize']}\n\n**Winner results**\n{result}",
+            color=discord.Color(0xFFFFFF),
+        )
+        result_embed.add_field(name="Unique entrants", value=str(len(entries)))
+        result_embed.add_field(name="Weighted entries", value=str(sum(entry_counts.values())))
+        result_embed.set_footer(text=f"Giveaway ended in {channel.guild.name}")
+        await channel.send(embed=result_embed)
         try:
             message = await channel.fetch_message(message_id)
-            await message.edit(view=None)
+            ended_embed = discord.Embed(
+                title="🎉 Giveaway ended",
+                description=(
+                    f"**Prize:** {data['prize']}\n"
+                    f"**Ended:** <t:{ended_at}:R>\n\n"
+                    f"**Winner results**\n{result}"
+                ),
+                color=discord.Color(0xFFFFFF),
+            )
+            ended_embed.set_footer(text=channel.guild.name)
+            await message.edit(embed=ended_embed, view=None)
         except discord.NotFound:
             pass
     return winners
@@ -1928,15 +1956,20 @@ async def giveaway(
 ) -> None:
     await interaction.response.defer(ephemeral=True)
     ends_at = int(time.time()) + minutes * 60
-    message = await interaction.channel.send(
-        embed=discord.Embed(
-            title="🎉 Giveaway",
-            description=(
-                f"**Prize:** {prize}\n**Winners:** {winners}\n"
-                f"**Ends:** <t:{ends_at}:R>\n\nUse the button below to enter."
-            ),
-            color=discord.Color.magenta(),
+    giveaway_embed = discord.Embed(
+        title="🎉 Giveaway",
+        description=(
+            f"**Prize:** {prize}\n**Winners:** {winners}\n"
+            f"**Ends:** <t:{ends_at}:R>\n\nUse the button below to enter."
         ),
+        color=discord.Color(0xFFFFFF),
+    )
+    giveaway_embed.set_footer(
+        text=f"Hosted by {interaction.user} • {interaction.guild.name}",
+        icon_url=interaction.guild.icon.url if interaction.guild.icon else None,
+    )
+    message = await interaction.channel.send(
+        embed=giveaway_embed,
         view=GiveawayView(),
     )
     with store.connect() as db:

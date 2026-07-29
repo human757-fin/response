@@ -174,6 +174,44 @@ class StoreTests(unittest.TestCase):
             row = db.execute("SELECT * FROM giveaway_entries WHERE message_id=1").fetchone()
         self.assertEqual(json.loads(json.dumps(dict(row)))["entries"], 4)
 
+    def test_giveaway_entry_can_only_be_created_once(self) -> None:
+        with self.store.connect() as db:
+            db.execute(
+                "INSERT INTO giveaways(message_id,guild_id,channel_id,prize,winner_count,ends_at,created_by) "
+                "VALUES (1,2,3,'Prize',1,9999999999,4)"
+            )
+
+        first = self.store.enter_giveaway(1, 5, "User", 4)
+        repeated = self.store.enter_giveaway(1, 5, "Changed user", 99)
+
+        self.assertEqual(first, (True, 4))
+        self.assertEqual(repeated, (False, 4))
+        with self.store.connect() as db:
+            count = db.execute(
+                "SELECT COUNT(*) AS count FROM giveaway_entries WHERE message_id=1 AND user_id=5"
+            ).fetchone()["count"]
+        self.assertEqual(count, 1)
+
+    def test_giveaway_panel_data_includes_active_entries_and_winners(self) -> None:
+        with self.store.connect() as db:
+            db.execute(
+                "INSERT INTO giveaways("
+                "message_id,guild_id,channel_id,prize,winner_count,ends_at,status,winners,created_by"
+                ") VALUES (1,2,3,'Test giveaway',1,9999999999,'active','[5]',4)"
+            )
+            db.execute(
+                "INSERT INTO giveaway_entries(message_id,user_id,username,entries) "
+                "VALUES (1,5,'Winner',4)"
+            )
+
+        giveaways = self.store.giveaways_for_guild(2)
+
+        self.assertEqual(len(giveaways), 1)
+        self.assertEqual(giveaways[0]["prize"], "Test giveaway")
+        self.assertEqual(giveaways[0]["total_entries"], 4)
+        self.assertEqual(giveaways[0]["winner_details"][0]["username"], "Winner")
+        self.assertEqual(self.store.giveaways_for_guild(999), [])
+
     def test_mysql_adapter_translates_placeholders(self) -> None:
         calls = []
 

@@ -166,10 +166,10 @@ PAGE = r"""<!doctype html>
     <div class="actions"><div class="toast" id="toast"></div><button class="primary" id="save" style="display:none">Save changes</button></div>
   </div>
   <script>
-    const state={guilds:[],guild:null,config:null,page:"dashboard",dirty:false,eventLogs:[],logSearch:"",logHasMore:false};
+    const state={guilds:[],guild:null,config:null,page:"dashboard",dirty:false,eventLogs:[],logSearch:"",logHasMore:false,giveawayTimer:null};
     const $=s=>document.querySelector(s), esc=s=>String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
     async function api(path,options={}) {
-      const response=await fetch(path,{headers:{"Content-Type":"application/json",...(options.headers||{})},...options});
+      const response=await fetch(path,{cache:"no-store",headers:{"Content-Type":"application/json",...(options.headers||{})},...options});
       if(response.status===401){showLogin();throw Error("Unauthorized")}
       const data=await response.json().catch(()=>({}));
       if(!response.ok)throw Error(data.error||`Request failed (${response.status})`);
@@ -203,6 +203,7 @@ PAGE = r"""<!doctype html>
     function title(){return {dashboard:"Overview",leveling:"Leveling",economy:"Economy",giveaways:"Giveaways",welcome:"Welcome & boost",
       moderation:"Moderation",eventlogs:"Event logs",antinuke:"Anti-nuke",sfx:"Voice & sound effects",messages:"Scheduled messages"}[state.page]}
     async function render(){
+      if(state.page!=="giveaways"&&state.giveawayTimer){clearTimeout(state.giveawayTimer);state.giveawayTimer=null}
       $("#pageTitle").textContent=title();$("#serverName").textContent=state.guild?.name||"No server selected";
       updateSaveButton();
       if(state.page==="dashboard")return renderDashboard();
@@ -297,12 +298,19 @@ PAGE = r"""<!doctype html>
       state.dirty=true;updateSaveButton();
     }
     async function renderGiveaways(){
+      if(state.giveawayTimer){clearTimeout(state.giveawayTimer);state.giveawayTimer=null}
       const d=await api(`/api/guilds/${state.guild.guild_id}/giveaways`);
-      $("#content").innerHTML=`<div class="card"><h2>Giveaways and entries</h2>${d.giveaways.length?d.giveaways.map(g=>
-        `<div class="event"><b>${esc(g.prize)}</b> · ${g.status} · ${g.winner_count} winner(s)
-        <div class="muted">Ends ${new Date(g.ends_at*1000).toLocaleString()} · ${g.entries.length} unique entrant(s)</div>
-        ${g.entries.length?`<table><tbody>${g.entries.map(x=>`<tr><td>${esc(x.username)}</td><td>${x.entries} entries</td></tr>`).join("")}</tbody></table>`:""}</div>`
+      $("#content").innerHTML=`<div class="card"><div class="settings-head"><div><h2>Giveaways and entries</h2>
+        <div class="muted">Automatically refreshes every 10 seconds</div></div><button id="giveawayRefresh">Refresh</button></div>
+        ${d.giveaways.length?d.giveaways.map(g=>
+        `<div class="event"><b>${esc(g.prize)}</b> · ${esc(g.status)} · ${g.winner_count} winner(s)
+        <div class="muted">Ends ${new Date(g.ends_at*1000).toLocaleString()} · ${g.entries.length} unique entrant(s) · ${g.total_entries} weighted entries ·
+        <a href="https://discord.com/channels/${state.guild.guild_id}/${g.channel_id}/${g.message_id}" target="_blank" rel="noopener">Open message</a></div>
+        ${g.winner_details.length?`<div><b>Winner${g.winner_details.length===1?"":"s"}:</b> ${g.winner_details.map(x=>`${esc(x.username)} (${x.entries} entr${x.entries===1?"y":"ies"})`).join(", ")}</div>`:""}
+        ${g.entries.length?`<table><thead><tr><th>Entrant</th><th>Weighted entries</th></tr></thead><tbody>${g.entries.map(x=>`<tr><td>${esc(x.username)}</td><td>${x.entries}</td></tr>`).join("")}</tbody></table>`:'<div class="muted">No entries yet.</div>'}</div>`
       ).join(""):'<div class="empty">Create a giveaway with the /giveaway command.</div>'}</div>`;
+      $("#giveawayRefresh").addEventListener("click",renderGiveaways);
+      state.giveawayTimer=setTimeout(()=>{if(state.page==="giveaways")renderGiveaways()},10000);
     }
     async function renderMessages(){
       const d=await api(`/api/guilds/${state.guild.guild_id}/schedules`);
@@ -670,25 +678,7 @@ async def sound_effect_delete(request: web.Request) -> web.Response:
 
 
 async def giveaways(request: web.Request) -> web.Response:
-    target = guild_id(request)
-    with store.connect() as db:
-        rows = [
-            dict(row)
-            for row in db.execute(
-                "SELECT * FROM giveaways WHERE guild_id=? ORDER BY ends_at DESC LIMIT 100", (target,)
-            ).fetchall()
-        ]
-        for giveaway in rows:
-            giveaway["winners"] = json.loads(giveaway["winners"])
-            giveaway["entries"] = [
-                dict(row)
-                for row in db.execute(
-                    "SELECT user_id, username, entries FROM giveaway_entries "
-                    "WHERE message_id=? ORDER BY entries DESC, username",
-                    (giveaway["message_id"],),
-                ).fetchall()
-            ]
-    return json_response({"giveaways": rows})
+    return json_response({"giveaways": store.giveaways_for_guild(guild_id(request))})
 
 
 async def schedules(request: web.Request) -> web.Response:

@@ -717,6 +717,72 @@ def add_audit(guild_id: int, event_type: str, detail: str) -> None:
         )
 
 
+def enter_giveaway(
+    message_id: int,
+    user_id: int,
+    username: str,
+    entries: int,
+) -> tuple[bool, int]:
+    weighted_entries = max(1, int(entries))
+    with connect() as db:
+        cursor = db.execute(
+            dialect(
+                """
+                INSERT INTO giveaway_entries(message_id, user_id, username, entries)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(message_id, user_id) DO NOTHING
+                """,
+                """
+                INSERT IGNORE INTO giveaway_entries(message_id, user_id, username, entries)
+                VALUES (?, ?, ?, ?)
+                """,
+            ),
+            (message_id, user_id, username[:255], weighted_entries),
+        )
+        row = db.execute(
+            "SELECT entries FROM giveaway_entries WHERE message_id=? AND user_id=?",
+            (message_id, user_id),
+        ).fetchone()
+    return bool(cursor.rowcount), int(row["entries"])
+
+
+def giveaways_for_guild(guild_id: int, limit: int = 100) -> list[dict[str, Any]]:
+    with connect() as db:
+        rows = [
+            dict(row)
+            for row in db.execute(
+                "SELECT * FROM giveaways WHERE guild_id=? "
+                "ORDER BY CASE WHEN status='active' THEN 0 ELSE 1 END, ends_at DESC LIMIT ?",
+                (guild_id, min(max(int(limit), 1), 500)),
+            ).fetchall()
+        ]
+        for giveaway in rows:
+            entry_rows = [
+                dict(row)
+                for row in db.execute(
+                    "SELECT user_id, username, entries FROM giveaway_entries "
+                    "WHERE message_id=? ORDER BY entries DESC, username",
+                    (giveaway["message_id"],),
+                ).fetchall()
+            ]
+            try:
+                winner_ids = [int(value) for value in json.loads(giveaway.get("winners") or "[]")]
+            except (TypeError, ValueError, json.JSONDecodeError):
+                winner_ids = []
+            entry_by_user = {int(entry["user_id"]): entry for entry in entry_rows}
+            giveaway["winners"] = winner_ids
+            giveaway["entries"] = entry_rows
+            giveaway["total_entries"] = sum(int(entry["entries"]) for entry in entry_rows)
+            giveaway["winner_details"] = [
+                entry_by_user.get(
+                    winner_id,
+                    {"user_id": winner_id, "username": f"User {winner_id}", "entries": 0},
+                )
+                for winner_id in winner_ids
+            ]
+    return rows
+
+
 def add_event_log(
     guild_id: int,
     event_type: str,
