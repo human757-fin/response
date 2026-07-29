@@ -139,7 +139,7 @@ send deleted content after the fact.
 Use a Python 3.12 egg and the supplied startup command:
 
 ```bash
-cd /home/container; mkdir -p /home/container/.pip-tmp; if [[ -d .git ]] && [[ "${AUTO_UPDATE}" == "1" ]]; then git pull; fi; if [[ -n "${PY_PACKAGES}" ]]; then TMPDIR=/home/container/.pip-tmp /usr/local/bin/python -m pip install --no-cache-dir --upgrade --target /home/container ${PY_PACKAGES} || exit 1; fi; if [[ -f requirements.txt ]] && [[ ! -f .requirements-installed || requirements.txt -nt .requirements-installed ]]; then TMPDIR=/home/container/.pip-tmp /usr/local/bin/python -m pip install --no-cache-dir --upgrade --target /home/container -r requirements.txt || exit 1; touch .requirements-installed; fi; /usr/local/bin/python webpanel.py & exec /usr/local/bin/python ${BOT_PY_FILE}
+cd /home/container; mkdir -p /home/container/.pip-tmp; if [[ -d .git ]] && [[ "${AUTO_UPDATE}" == "1" ]]; then git pull; fi; if [[ -n "${PY_PACKAGES}" ]]; then TMPDIR=/home/container/.pip-tmp /usr/local/bin/python -m pip install --no-cache-dir --upgrade --target /home/container ${PY_PACKAGES} || exit 1; fi; if [[ -f requirements.txt ]] && [[ ! -f .requirements-installed || requirements.txt -nt .requirements-installed ]]; then TMPDIR=/home/container/.pip-tmp /usr/local/bin/python -m pip install --no-cache-dir --upgrade --target /home/container -r requirements.txt || exit 1; touch .requirements-installed; fi; exec /bin/bash /home/container/start.sh
 ```
 
 Configure these Pterodactyl variables:
@@ -178,14 +178,19 @@ when connecting directly. Set it to `1` only when a trusted reverse proxy
 overwrites `X-Forwarded-For` or `X-Real-IP`; otherwise clients could spoof the
 logged address.
 
-The startup line launches `webpanel.py` in the background and keeps `bot.py` as
-the Pterodactyl-managed foreground process. If the bot exits, the server is
-considered stopped and Pterodactyl can restart it. Pip stages installations in
+The startup line runs `start.sh`, which supervises the bot and panel together. If
+either service exits, it stops the other one and lets Pterodactyl restart a clean
+pair, preventing an old background panel from surviving an update. Pip stages installations in
 `.pip-tmp` instead of Wings' small `/tmp` mount and records a successful install
 in `.requirements-installed`, avoiding a full reinstall on every restart. Delete
 only that marker when you intentionally need to reinstall unchanged
 requirements. The bot will not start when dependency installation fails, which
 prevents an old or partially installed discord.py build from running.
+
+The panel header and both `/health` endpoints show a source build ID. The bot and
+panel health responses also show a hashed `database_id`; those values must match.
+Different database IDs mean the two processes received different database
+variables.
 
 ### Voice troubleshooting
 

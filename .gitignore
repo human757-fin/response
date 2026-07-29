@@ -10,4 +10,6 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 .venv/
+.pip-tmp/
+.requirements-installed
 data/sfx/

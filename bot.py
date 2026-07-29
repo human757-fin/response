@@ -39,6 +39,8 @@ BOT_PORT = int(os.getenv("BOT_PORT", "2067"))
 DEV_GUILD_ID = int(os.getenv("DEV_GUILD_ID", "0") or 0)
 SFX_ROOT = store.ROOT / "data" / "sfx"
 SFX_ROOT.mkdir(parents=True, exist_ok=True)
+BUILD_ID = store.source_build_id()
+DATABASE_ID = store.database_id()
 voice_connect_locks: dict[int, asyncio.Lock] = {}
 voice_retry_after: dict[int, float] = {}
 
@@ -521,6 +523,8 @@ class ResponseBot(commands.Bot):
                     "latency_ms": round(self.latency * 1000),
                     "uptime_seconds": round(time.time() - self.started_at),
                     "database": store.database_backend(),
+                    "database_id": DATABASE_ID,
+                    "build": BUILD_ID,
                     "python": sys.version.split()[0],
                     "discord_py": discord.__version__,
                 }

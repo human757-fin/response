@@ -33,6 +33,8 @@ SFX_ROOT = store.ROOT / "data" / "sfx"
 SFX_ROOT.mkdir(parents=True, exist_ok=True)
 SFX_NAME = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
 SFX_EXTENSIONS = {".mp3", ".wav", ".ogg", ".m4a", ".webm", ".flac"}
+BUILD_ID = store.source_build_id()
+DATABASE_ID = store.database_id()
 
 
 PAGE = r"""<!doctype html>
@@ -160,7 +162,7 @@ PAGE = r"""<!doctype html>
     </aside>
     <main>
       <header><div><h1 id="pageTitle">Overview</h1><p class="muted" id="serverName">Loading your server…</p></div>
-        <div class="status"><span class="dot"></span> PANEL ONLINE</div></header>
+        <div class="status"><span class="dot"></span> PANEL ONLINE · __RESPONSE_BUILD__</div></header>
       <section id="content"></section>
     </main>
     <div class="actions"><div class="toast" id="toast"></div><button class="primary" id="save" style="display:none">Save changes</button></div>
@@ -367,7 +369,12 @@ PAGE = r"""<!doctype html>
 
 
 def json_response(data: Any, status: int = 200) -> web.Response:
-    return web.json_response(data, status=status, dumps=lambda value: json.dumps(value, default=str))
+    return web.json_response(
+        data,
+        status=status,
+        headers={"Cache-Control": "no-store", "X-Response-Build": BUILD_ID},
+        dumps=lambda value: json.dumps(value, default=str),
+    )
 
 
 def authenticated(request: web.Request) -> bool:
@@ -406,6 +413,8 @@ async def access_log_middleware(request: web.Request, handler: Any) -> web.Strea
     try:
         response = await handler(request)
         status = response.status
+        response.headers["Cache-Control"] = "no-store"
+        response.headers["X-Response-Build"] = BUILD_ID
         return response
     except web.HTTPException as exc:
         status = exc.status
@@ -431,7 +440,11 @@ async def auth_middleware(request: web.Request, handler: Any) -> web.StreamRespo
 
 
 async def index(_: web.Request) -> web.Response:
-    return web.Response(text=PAGE, content_type="text/html")
+    return web.Response(
+        text=PAGE.replace("__RESPONSE_BUILD__", BUILD_ID),
+        content_type="text/html",
+        headers={"Cache-Control": "no-store", "X-Response-Build": BUILD_ID},
+    )
 
 
 async def health(_: web.Request) -> web.Response:
@@ -442,6 +455,8 @@ async def health(_: web.Request) -> web.Response:
             "port": WEB_PORT,
             "authentication": "enabled" if WEBUI_PASSWORD else "disabled",
             "database": store.database_backend(),
+            "database_id": DATABASE_ID,
+            "build": BUILD_ID,
         }
     )
 
@@ -777,5 +792,10 @@ def create_app() -> web.Application:
 if __name__ == "__main__":
     if not WEBUI_PASSWORD:
         log.warning("WEBUI_PASSWORD is not set; the management panel has no login protection")
-    log.info("Response web panel listening on port %s", WEB_PORT)
+    log.info(
+        "Response web panel build %s using database %s, listening on port %s",
+        BUILD_ID,
+        DATABASE_ID,
+        WEB_PORT,
+    )
     web.run_app(create_app(), host="0.0.0.0", port=WEB_PORT, print=None)

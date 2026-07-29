@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -28,6 +29,33 @@ USE_MYSQL = (
 _MYSQL_CONNECTION: Any = None
 _MYSQL_LOCK = threading.RLock()
 _EVENT_PRUNE_COUNTS: dict[int, int] = {}
+
+
+def source_build_id() -> str:
+    digest = hashlib.sha256()
+    for name in ("bot.py", "webpanel.py", "response_core.py", "response_cards.py"):
+        path = ROOT / name
+        try:
+            digest.update(name.encode())
+            digest.update(path.read_bytes())
+        except OSError:
+            continue
+    return digest.hexdigest()[:12]
+
+
+def database_id() -> str:
+    if USE_MYSQL:
+        if DATABASE_URL:
+            parsed = urlparse(DATABASE_URL.replace("mysql+pymysql://", "mysql://", 1))
+            identity = f"mysql:{parsed.hostname}:{parsed.port or 3306}:{parsed.path.lstrip('/')}"
+        else:
+            identity = (
+                f"mysql:{os.getenv('DB_HOST', '')}:{os.getenv('DB_PORT', '3306')}:"
+                f"{os.getenv('DB_NAME', '')}"
+            )
+    else:
+        identity = f"sqlite:{DATABASE_PATH.resolve()}"
+    return hashlib.sha256(identity.encode()).hexdigest()[:12]
 
 
 DEFAULT_CONFIG: dict[str, Any] = {
