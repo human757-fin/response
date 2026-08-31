@@ -16,6 +16,7 @@ from urllib.parse import urlparse
 from aiohttp import web
 
 import response_core as store
+from response_cards import render_card
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
@@ -184,9 +185,15 @@ PAGE = r"""<!doctype html>
     }
     function toast(message,bad=false){const e=$("#toast");e.textContent=message;e.style.color=bad?"#ff9c9c":"";e.classList.add("show");setTimeout(()=>e.classList.remove("show"),2600)}
     function showLogin(){$("#login").style.display="grid";$("#app").style.display="none"}
+    const PAGE_BUILD="${'__RESPONSE_BUILD__'}";
+    async function checkBuild(){
+      try{const h=await fetch("/health",{cache:"no-store"});const j=await h.json();const server=j.build;
+        if(PAGE_BUILD&&server&&PAGE_BUILD!==server){console.log("Response UI updated, reloading");location.reload()}}catch(e){}
+    }
     async function boot(){
       try{
         state.guilds=(await api("/api/guilds")).guilds;
+        checkBuild();
         $("#login").style.display="none";$("#app").style.display="block";
         $("#guild").innerHTML=state.guilds.map(g=>`<option value="${g.guild_id}">${esc(g.name)}</option>`).join("");
         if(!state.guilds.length){$("#content").innerHTML='<div class="card empty">Invite and start the bot to register a Discord server.</div>';return}
@@ -225,6 +232,7 @@ PAGE = r"""<!doctype html>
       if(state.page==="shop")return renderShop();
       if(state.page==="reactionroles")return renderReactionRoles();
       if(state.page==="stickers")return renderSticky();
+      if(state.page==="welcome")return renderWelcome();
       renderSettings(pageMap[state.page]||[]);
     }
     async function renderLeveling(){
@@ -420,6 +428,16 @@ PAGE = r"""<!doctype html>
       document.querySelectorAll("[data-sticky]").forEach(b=>b.addEventListener("click",async()=>{
         await api(`/api/guilds/${state.guild.guild_id}/stickies/${b.dataset.sticky}`,{method:"DELETE"});
         toast("Sticky removed");renderSticky()}));
+    }
+    async function renderWelcome(){
+      const previewUrl=`/api/guilds/${state.guild.guild_id}/welcome-preview?t=${Date.now()}`;
+      $("#content").innerHTML=`<div class="card" style="margin-bottom:16px"><div class="settings-head">
+        <div><h2>Welcome card preview</h2><div class="muted">Edit the welcome card colour/background below, then click Save changes and Refresh.</div></div>
+        <button id="welcomeRefresh">Refresh preview</button></div>
+        <img src="${previewUrl}" alt="Welcome card preview" style="max-width:100%;border-radius:12px;border:1px solid var(--line)"></div>`+
+        settingsMarkup(["welcome","boost"]);
+      $("#welcomeRefresh").addEventListener("click",()=>{const img=$("#content img");if(img)img.src=previewUrl});
+      bindSettings();
     }
     async function renderDashboard(){
       const d=await api(`/api/guilds/${state.guild.guild_id}/dashboard`);
@@ -1055,6 +1073,33 @@ async def widget(request: web.Request) -> web.Response:
     })
 
 
+async def welcome_preview(request: web.Request) -> web.Response:
+    target = guild_id(request)
+    config = store.get_config(target)
+    welcome = config["welcome"]
+    try:
+        import asyncio
+        card = await asyncio.to_thread(
+            render_card,
+            title="MemberName",
+            subtitle="Example Server",
+            detail="Member #1234",
+            avatar=None,
+            background=None,
+            start_color=str(welcome.get("card_color") or "#5865F2"),
+            end_color="#9B59B6",
+            configured_font="",
+        )
+    except Exception as exc:
+        log.warning("Could not render welcome preview: %s", exc)
+        return json_response({"error": "Preview could not be rendered"}, 500)
+    return web.Response(
+        body=card.getvalue(),
+        content_type="image/png",
+        headers={"Cache-Control": "no-store", "X-Response-Build": BUILD_ID},
+    )
+
+
 async def activity_series_endpoint(request: web.Request) -> web.Response:
     try:
         days = min(max(int(request.query.get("days", "14")), 1), 90)
@@ -1097,6 +1142,7 @@ def create_app() -> web.Application:
         reaction_role_delete,
     )
     app.router.add_get("/api/guilds/{guild_id}/activity", activity_series_endpoint)
+    app.router.add_get("/api/guilds/{guild_id}/welcome-preview", welcome_preview)
     app.router.add_get("/api/guilds/{guild_id}/stickies", stickies_endpoint)
     app.router.add_delete("/api/guilds/{guild_id}/stickies/{channel_id}", sticky_delete)
     app.router.add_get("/widget/{guild_id}", widget)
