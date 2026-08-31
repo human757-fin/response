@@ -75,3 +75,50 @@
   -disconnect, server mute and server deafen utilities
   -upload audio files or save HTTP(S) audio links in the web UI
   -saved sound list, autocomplete, per-sound volume and playback cooldown
+
+# ADDED FEATURES
+## Sticky messages
+  -/sticky set pins a message to the bottom of a channel and re-posts it when pushed down
+  -/sticky remove and an Unstick button
+
+## Starboard
+  -react with a configurable emoji to surface the best messages into a starboard channel
+  -editable threshold, emoji and channel from the web UI
+
+## Auto roles
+  -automatically assign chosen roles to new members on join
+
+## Custom commands
+  -create text-trigger commands with a chosen prefix in Discord or the web UI
+  -manage/delete commands from a dedicated web page
+
+## Economy shop
+  -/shop list, /shop add, /shop remove, /shop buy and /shop inventory
+  -items can grant a role, have a limited stock and a description
+  -admin manage the shop from the web UI
+
+## Reaction role builder
+  -visual web UI to bind emoji -> role -> message without commands
+
+## Activity graphs
+  -dashboard shows a 14-day activity bar chart pulled from the event log
+
+## AFK system
+  -/afk reason; messages mentioning you reveal your AFK reason, first message clears it
+
+## Reminders
+  -/remind duration message, /reminders and /reminder-delete, delivered as a DM
+  -restart-proof via the scheduled-due job loop
+
+## Ticket transcripts
+  -closing a ticket can save an HTML transcript to a configurable channel
+
+## Level-role sync
+  -when a member's role changes, level roles are added/removed to match their level
+
+## Server stats widget
+  -public /widget/{guild_id} HTML embed showing member count, total XP, economy and top 10
+
+## Paged leaderboard
+  -/xp-leaderboard now supports page navigation buttons
+

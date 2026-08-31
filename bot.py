@@ -6,6 +6,7 @@ The bot also serves a small health API on BOT_PORT (2067 by default).
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import logging
 import os
@@ -365,8 +366,49 @@ class TicketCloseView(discord.ui.View):
             return await interaction.response.send_message("This is not a ticket.", ephemeral=True)
         await interaction.response.send_message("Closing this ticket in 5 seconds…")
         store.add_audit(interaction.guild.id, "ticket_closed", interaction.channel.name)
+        transcript_channel = None
+        tickets_config = store.get_config(interaction.guild.id)["tickets"]
+        if tickets_config.get("transcript_channel"):
+            transcript_channel = interaction.guild.get_channel(
+                int(tickets_config["transcript_channel"])
+            )
+        if isinstance(transcript_channel, discord.TextChannel):
+            try:
+                transcript = await build_ticket_transcript(interaction.channel)
+                if transcript:
+                    await transcript_channel.send(
+                        content=f"Transcript for **{interaction.channel.name}** closed by "
+                                f"{interaction.user}",
+                        file=transcript,
+                    )
+            except (discord.HTTPException, discord.Forbidden) as exc:
+                log.warning("Could not save ticket transcript for %s: %s", interaction.channel.id, exc)
         await asyncio.sleep(5)
         await interaction.channel.delete(reason=f"Ticket closed by {interaction.user}")
+
+
+async def build_ticket_transcript(channel: discord.TextChannel) -> discord.File | None:
+    try:
+        messages = [message async for message in channel.history(limit=250, oldest_first=True)]
+    except discord.HTTPException:
+        return None
+    lines = [
+        f"<html><head><meta charset='utf-8'><title>{channel.name} transcript</title></head><body>",
+        f"<h1>Ticket transcript: {channel.name}</h1>",
+    ]
+    for message in messages:
+        author = message.author
+        content = message.content or ""
+        attachments = " ".join(f'<a href="{a.url}">📎 {a.filename}</a>' for a in message.attachments)
+        stamp = message.created_at.strftime("%Y-%m-%d %H:%M")
+        safe_content = content.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        lines.append(
+            f"<p><strong>{author}</strong> <small>({stamp})</small><br>{safe_content} "
+            f"{attachments}<br></p>"
+        )
+    lines.append("</body></html>")
+    html = "\n".join(lines).encode("utf-8")
+    return discord.File(io.BytesIO(html), filename=f"transcript-{channel.name}.html")
 
 
 def ticket_channel_name(member: discord.Member) -> str:
@@ -498,6 +540,7 @@ class ResponseBot(commands.Bot):
         self.add_view(GiveawayView())
         self.add_view(TicketPanelView())
         self.add_view(TicketCloseView())
+        self.add_view(StickyView())
         await self.start_health_server()
         voice_rewards.start()
         due_jobs.start()
@@ -732,6 +775,31 @@ async def reward_level_roles(member: discord.Member, level: int, mapping: dict[s
                     log.warning("Cannot add level role %s in guild %s", role.id, member.guild.id)
 
 
+async def remove_wrong_level_roles(member: discord.Member) -> None:
+    cfg = store.get_config(member.guild.id)["leveling"]
+    mapping = cfg["level_roles"]
+    data = store.get_member(member.guild.id, member.id, str(member))
+    current = int(data["level"])
+    to_add: list[discord.Role] = []
+    to_remove: list[discord.Role] = []
+    for required_level, role_id in mapping.items():
+        role = member.guild.get_role(int(role_id))
+        if not role:
+            continue
+        has = role in member.roles
+        if int(required_level) <= current and not has:
+            to_add.append(role)
+        elif int(required_level) > current and has:
+            to_remove.append(role)
+    try:
+        if to_add:
+            await member.add_roles(*to_add, reason="Response level sync")
+        if to_remove:
+            await member.remove_roles(*to_remove, reason="Response level below requirement")
+    except discord.Forbidden:
+        log.warning("Cannot sync level roles for %s in guild %s", member.id, member.guild.id)
+
+
 async def announce_level(member: discord.Member, level: int, cfg: dict[str, Any]) -> None:
     channel = member.guild.get_channel(int(cfg["level_up_channel"] or 0))
     if not isinstance(channel, discord.TextChannel):
@@ -850,6 +918,33 @@ async def on_message(message: discord.Message) -> None:
         )
     if message.author.bot or not isinstance(message.author, discord.Member):
         return
+
+    if message.mentions:
+        for mentioned in message.mentions:
+            afk_record = store.get_afk(message.guild.id, mentioned.id)
+            if afk_record:
+                await message.channel.send(
+                    f"{message.author.mention}, **{mentioned.display_name}** is AFK: "
+                    f"**{afk_record['reason'] or 'No reason set'}**"
+                )
+                break
+    if store.get_afk(message.guild.id, message.author.id):
+        store.clear_afk(message.guild.id, message.author.id)
+        await message.channel.send(
+            f"Welcome back, {message.author.mention}! I removed your AFK status."
+        )
+
+    cc_config = cfg["custom_commands"]
+    if cc_config["enabled"]:
+        prefix = cc_config.get("prefix", "!")
+        lowered = message.content.strip()
+        if lowered.startswith(prefix) and len(lowered) > len(prefix):
+            trigger = lowered[len(prefix):].split()[0].lower().lstrip("/")
+            command = store.get_custom_command(message.guild.id, trigger)
+            if command and command["enabled"]:
+                await message.channel.send(command["response"])
+                return
+
     leveling, economy = cfg["leveling"], cfg["economy"]
     xp = money = 0.0
     cooldown = int(leveling["message_cooldown"])
@@ -880,7 +975,61 @@ async def on_message(message: discord.Message) -> None:
     if result["level"] > result["old_level"]:
         await reward_level_roles(message.author, result["level"], leveling["level_roles"])
         await announce_level(message.author, result["level"], leveling)
+    await process_sticky(message.guild, message.channel)
     await bot.process_commands(message)
+
+
+async def process_sticky(guild: discord.Guild, channel: discord.TextChannel) -> None:
+    """Re-post stickied messages that have been pushed down by recent activity."""
+    if not store.get_config(guild.id)["sticky"]["enabled"]:
+        return
+    stickies = {int(item["channel_id"]): item for item in store.get_stickied(guild.id)}
+    sticky = stickies.get(channel.id)
+    if not sticky:
+        return
+    try:
+        async for msg in channel.history(limit=6):
+            if msg.author == bot.user and msg.id != sticky.get("pinned_copy_id"):
+                if msg.embeds:
+                    continue
+                if msg.content and msg.content.startswith("📌"):
+                    return
+        embed = None
+        if sticky.get("embed_json"):
+            try:
+                embed = discord.Embed.from_dict(json.loads(sticky["embed_json"]))
+            except (ValueError, TypeError):
+                embed = None
+        await channel.send(
+            content=("📌 **Sticky** • " + (sticky["message_content"] or "")),
+            embed=embed,
+        )
+    except discord.HTTPException:
+        pass
+
+
+class StickyView(discord.ui.View):
+    def __init__(self) -> None:
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="Unstick",
+        emoji="📌",
+        style=discord.ButtonStyle.secondary,
+        custom_id="response:sticky:remove",
+    )
+    async def unsticky_button(
+        self, interaction: discord.Interaction, _: discord.ui.Button
+    ) -> None:
+        if not interaction.guild or not isinstance(interaction.user, discord.Member):
+            return
+        if not interaction.user.guild_permissions.manage_messages:
+            return await interaction.response.send_message(
+                "You need Manage Messages to unstick.", ephemeral=True
+            )
+        store.unstick(interaction.guild.id, interaction.channel_id)
+        await interaction.message.delete()
+        await interaction.response.send_message("Sticky message removed.", ephemeral=True)
 
 
 @bot.event
@@ -915,6 +1064,7 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent) -> None:
         role = guild.get_role(int(row["role_id"]))
         if role:
             await member.add_roles(role, reason="Response reaction role")
+    await update_starboard(guild, payload.channel_id, payload.message_id, payload.emoji, 1)
     cfg = store.get_config(guild.id)["leveling"]
     if cfg["enabled"]:
         result = store.add_activity(
@@ -957,13 +1107,74 @@ async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent) -> Non
         role = guild.get_role(int(row["role_id"]))
         if member and role:
             await member.remove_roles(role, reason="Response reaction role removed")
+    await update_starboard(guild, payload.channel_id, payload.message_id, payload.emoji, -1)
+
+
+async def update_starboard(
+    guild: discord.Guild, channel_id: int, message_id: int, emoji: object, delta: int
+) -> None:
+    starboard_config = store.get_config(guild.id)["starboard"]
+    if not starboard_config["enabled"] or not starboard_config["channel"]:
+        return
+    if str(emoji) != str(starboard_config["emoji"] or "⭐"):
+        return
+    try:
+        source_channel = guild.get_channel(channel_id)
+        if not isinstance(source_channel, discord.TextChannel):
+            return
+        source = await source_channel.fetch_message(message_id)
+        if not source.content and not source.attachments:
+            return
+        row = store.starboard_row(message_id)
+        current_stars = (int(row["stars"]) if row else 0) + delta
+        if current_stars <= 0:
+            store.starboard_remove(message_id)
+            return
+        threshold = max(1, int(starboard_config["threshold"] or 3))
+        target_channel = guild.get_channel(int(starboard_config["channel"]))
+        if not isinstance(target_channel, discord.TextChannel):
+            return
+        embed = discord.Embed(
+            description=source.content[:2000] or "*No text content*",
+            color=discord.Color.gold(),
+            timestamp=source.created_at,
+        )
+        embed.set_author(name=source.author.display_name, icon_url=source.author.display_avatar.url)
+        embed.add_field(name="Source", value=source.jump_url)
+        if source.attachments:
+            embed.set_image(url=source.attachments[0].url)
+        footer_text = f"⭐ {current_stars}"
+        if row and row.get("star_message_id"):
+            try:
+                star_message = await target_channel.fetch_message(int(row["star_message_id"]))
+                embed.set_footer(text=footer_text)
+                await star_message.edit(embed=embed)
+                store.starboard_add_or_update(message_id, guild.id, channel_id, current_stars, int(row["star_message_id"]))
+                return
+            except discord.NotFound:
+                pass
+        if current_stars >= threshold:
+            sent = await target_channel.send(embed=embed)
+            store.starboard_add_or_update(message_id, guild.id, channel_id, current_stars, sent.id)
+    except (discord.HTTPException, discord.Forbidden):
+        return
 
 
 @bot.event
 async def on_member_join(member: discord.Member) -> None:
-    cfg = store.get_config(member.guild.id)["welcome"]
-    if cfg["enabled"] and cfg["channel"]:
-        channel = member.guild.get_channel(int(cfg["channel"]))
+    cfg = store.get_config(member.guild.id)
+    auto_role_config = cfg["auto_roles"]
+    if auto_role_config["enabled"]:
+        for role_id in auto_role_config["roles"]:
+            role = member.guild.get_role(int(role_id)) if str(role_id).isdigit() else None
+            if role and role < member.guild.me.top_role and role not in member.roles:
+                try:
+                    await member.add_roles(role, reason="Response auto role")
+                except discord.Forbidden:
+                    log.warning("Cannot auto-assign role %s in guild %s", role, member.guild.id)
+    welcome = cfg["welcome"]
+    if welcome["enabled"] and welcome["channel"]:
+        channel = member.guild.get_channel(int(welcome["channel"]))
         if isinstance(channel, discord.TextChannel):
             card = await discord_card(
                 member,
@@ -971,13 +1182,13 @@ async def on_member_join(member: discord.Member) -> None:
                 subtitle=member.guild.name,
                 detail=f"Member #{member.guild.member_count}",
                 settings={
-                    "background_image": cfg["card_background"],
-                    "progress_start": cfg["card_color"],
+                    "background_image": welcome["card_background"],
+                    "progress_start": welcome["card_color"],
                     "progress_end": "#9B59B6",
                 },
             )
             await channel.send(
-                cfg["message"].format(
+                welcome["message"].format(
                     mention=member.mention,
                     user=member.display_name,
                     server=member.guild.name,
@@ -1186,6 +1397,8 @@ async def on_member_update(before: discord.Member, after: discord.Member) -> Non
                     ),
                     file=card,
                 )
+    if before.roles != after.roles:
+        await remove_wrong_level_roles(after)
     if not logging_enabled(after.guild, "member_updates"):
         return
     changes: list[str] = []
@@ -1576,8 +1789,25 @@ async def due_jobs() -> None:
                 "SELECT * FROM scheduled_messages WHERE enabled=1 AND send_at<=?", (now,)
             ).fetchall()
         ]
+        reminders = [
+            dict(row)
+            for row in db.execute(
+                "SELECT * FROM reminders WHERE enabled=1 AND send_at<=?", (now,)
+            ).fetchall()
+        ]
     for message_id in giveaway_ids:
         await finish_giveaway(int(message_id))
+    for reminder in reminders:
+        channel = bot.get_channel(int(reminder["channel_id"]))
+        if isinstance(channel, discord.TextChannel):
+            try:
+                await channel.send(
+                    f"<@{reminder['user_id']}> 🔔 Reminder: **{reminder['content']}**"
+                )
+            except discord.HTTPException:
+                pass
+        with store.connect() as db:
+            db.execute("UPDATE reminders SET enabled=0 WHERE id=?", (reminder["id"],))
     for job in schedules:
         channel = bot.get_channel(int(job["channel_id"]))
         if isinstance(channel, discord.TextChannel):
@@ -1784,22 +2014,63 @@ async def coinflip(
     )
 
 
+class LeaderboardView(discord.ui.View):
+    def __init__(self, guild_id: int, color: discord.Color, page_size: int = 10) -> None:
+        super().__init__(timeout=180)
+        self.guild_id = guild_id
+        self.color = color
+        self.page_size = page_size
+        self.page = 0
+
+    def total(self) -> int:
+        with store.connect() as db:
+            row = db.execute(
+                "SELECT COUNT(*) AS count FROM members WHERE guild_id=?", (self.guild_id,)
+            ).fetchone()
+        return int(row["count"]) if row else 0
+
+    def embed(self) -> discord.Embed:
+        rows = store.leaderboard(self.guild_id, limit=100)
+        pages = max(1, (len(rows) + self.page_size - 1) // self.page_size)
+        self.page = min(self.page, pages - 1)
+        chunk = rows[self.page * self.page_size : (self.page + 1) * self.page_size]
+        total = self.total()
+        description = "\n".join(
+            f"**{index + self.page * self.page_size + 1}.** <@{row['user_id']}> — "
+            f"level {row['level']} · {row['xp']:,} XP"
+            for index, row in enumerate(chunk)
+        ) or "No activity yet."
+        embed = discord.Embed(
+            title="XP leaderboard",
+            description=description,
+            color=self.color,
+            footer=discord.EmbedFooter(text=f"Page {self.page+1} of {pages} · {total} members"),
+        )
+        return embed
+
+    @discord.ui.button(label="◀", style=discord.ButtonStyle.secondary, row=0)
+    async def previous(
+        self, interaction: discord.Interaction, _: discord.ui.Button
+    ) -> None:
+        self.page = max(0, self.page - 1)
+        await interaction.response.edit_message(embed=self.embed())
+
+    @discord.ui.button(label="▶", style=discord.ButtonStyle.secondary, row=0)
+    async def next_button(
+        self, interaction: discord.Interaction, _: discord.ui.Button
+    ) -> None:
+        await interaction.response.edit_message(embed=self.embed())
+        self.page += 1
+
+
 @bot.tree.command(name="xp-leaderboard", description="Show the server XP leaderboard")
 async def xp_leaderboard(interaction: discord.Interaction) -> None:
     guild = await guild_only(interaction)
     if not guild:
         return
-    rows = store.leaderboard(guild.id)
-    description = "\n".join(
-        f"**{index}.** <@{row['user_id']}> — level {row['level']} · {row['xp']:,} XP"
-        for index, row in enumerate(rows, 1)
-    ) or "No activity yet."
     cfg = store.get_config(guild.id)["leveling"]
-    await interaction.response.send_message(
-        embed=discord.Embed(
-            title="XP leaderboard", description=description, color=color(cfg["leaderboard_color"])
-        )
-    )
+    view = LeaderboardView(guild.id, color(cfg["leaderboard_color"]))
+    await interaction.response.send_message(embed=view.embed(), view=view)
 
 
 @bot.tree.command(description="Create and send a customizable embed")
@@ -2481,6 +2752,245 @@ async def sfx_name_autocomplete(
 bot.tree.add_command(mod_group)
 bot.tree.add_command(voice_group)
 bot.tree.add_command(sfx_group)
+
+sticky_group = app_commands.Group(name="sticky", description="Sticky message controls")
+
+
+@sticky_group.command(name="set", description="Pin a message that stays at the bottom of the channel")
+@app_commands.checks.has_permissions(manage_messages=True)
+@app_commands.describe(message="Optional text; leave blank to pin the last message")
+async def sticky_set(
+    interaction: discord.Interaction, message: str | None = None
+) -> None:
+    if not isinstance(interaction.channel, discord.TextChannel):
+        return await interaction.response.send_message(
+            "Use this in a text channel.", ephemeral=True
+        )
+    content = message
+    if not content and interaction.channel.last_message:
+        content = interaction.channel.last_message.content
+    if not content:
+        return await interaction.response.send_message(
+            "Provide sticky text or point at a recent message.", ephemeral=True
+        )
+    store.set_stickied(interaction.guild_id, interaction.channel.id, content[:2000], None)
+    sent = await interaction.channel.send(
+        f"📌 **Sticky** • {content}", view=StickyView()
+    )
+    await interaction.response.send_message(
+        f"Pinned as sticky in {interaction.channel.mention}.", ephemeral=True
+    )
+
+
+@sticky_group.command(name="remove", description="Remove the sticky message from this channel")
+@app_commands.checks.has_permissions(manage_messages=True)
+async def sticky_remove(interaction: discord.Interaction) -> None:
+    store.unstick(interaction.guild_id, interaction.channel_id)
+    await interaction.response.send_message("Sticky removed.", ephemeral=True)
+
+
+custom_cmd_group = app_commands.Group(
+    name="command", description="Custom text commands"
+)
+
+
+@custom_cmd_group.command(name="add", description="Create a custom text command")
+@app_commands.checks.has_permissions(manage_messages=True)
+async def custom_cmd_add(interaction: discord.Interaction, name: str, response: str) -> None:
+    if len(name) > 32 or not name.isalnum():
+        return await interaction.response.send_message(
+            "Command names must be letters/numbers and under 32 characters.", ephemeral=True
+        )
+    if not response.strip():
+        return await interaction.response.send_message(
+            "The response cannot be empty.", ephemeral=True
+        )
+    store.set_custom_command(interaction.guild_id, name, response)
+    await interaction.response.send_message(
+        f"Custom command **!{name.lower()}** created.", ephemeral=True
+    )
+
+
+@custom_cmd_group.command(name="list", description="List custom commands")
+async def custom_cmd_list(interaction: discord.Interaction) -> None:
+    commands = store.list_custom_commands(interaction.guild_id)
+    lines = "\n".join(
+        f"**!{row['trigger']}** — {row['response'][:80]}{'…' if len(row['response'])>80 else ''}"
+        for row in commands
+    ) or "No custom commands yet."
+    await interaction.response.send_message(
+        embed=discord.Embed(title="Custom commands", description=lines[:4000]),
+        ephemeral=True,
+    )
+
+
+@custom_cmd_group.command(name="remove", description="Delete a custom command")
+@app_commands.checks.has_permissions(manage_messages=True)
+async def custom_cmd_remove(interaction: discord.Interaction, name: str) -> None:
+    if store.delete_custom_command(interaction.guild_id, name):
+        await interaction.response.send_message(f"Removed **!{name.lower()}**.", ephemeral=True)
+    else:
+        await interaction.response.send_message("Command not found.", ephemeral=True)
+
+
+@bot.tree.command(description="Go AFK with an optional reason")
+@app_commands.describe(reason="Optional reason shown to anyone who mentions you")
+async def afk(interaction: discord.Interaction, reason: str = "") -> None:
+    store.set_afk(interaction.guild_id, interaction.user.id, reason)
+    await interaction.response.send_message(
+        f"You are now AFK. {reason or 'No reason set'} I'll mention your reason if someone pings you."
+    )
+
+
+@bot.tree.command(name="remind", description="Set a reminder that is delivered as a DM")
+@app_commands.describe(duration="e.g. 2h30m, 30s, 1d", message="Reminder text")
+async def remind(
+    interaction: discord.Interaction,
+    duration: str,
+    message: str,
+) -> None:
+    match = re.match(
+        r"^\s*(?:(\d+)\s*d)?\s*(?:(\d+)\s*h)?\s*(?:(\d+)\s*m)?\s*(?:(\d+)\s*s)?\s*$",
+        duration.lower(),
+    )
+    if not match or not any(match.groups()):
+        return await interaction.response.send_message(
+            "Use a duration like `2h`, `90s`, or `1d 12h`.", ephemeral=True
+        )
+    days, hours, mins, secs = (int(g) if g else 0 for g in match.groups())
+    seconds = days * 86400 + hours * 3600 + mins * 60 + secs
+    if seconds <= 0 or seconds > 365 * 86400:
+        return await interaction.response.send_message(
+            "Reminder must be between 1 second and 1 year.", ephemeral=True
+        )
+    send_at = int(time.time()) + seconds
+    reminder_id = store.add_reminder(
+        interaction.user.id, interaction.channel_id, interaction.guild_id, message, send_at
+    )
+    await interaction.response.send_message(
+        f"Reminder **#{reminder_id}** set for <t:{send_at}:R>.", ephemeral=True
+    )
+
+
+@bot.tree.command(name="reminders", description="List your pending reminders")
+async def reminders_list(interaction: discord.Interaction) -> None:
+    rows = store.list_reminders(interaction.user.id)
+    lines = "\n".join(
+        f"**#{row['id']}** · <t:{row['send_at']}:R> · {row['content'][:80]}"
+        for row in rows[:15]
+    ) or "No reminders set."
+    await interaction.response.send_message(
+        embed=discord.Embed(title="Your reminders", description=lines[:4000]),
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(name="reminder-delete", description="Cancel a pending reminder")
+async def reminder_delete(interaction: discord.Interaction, reminder_id: int) -> None:
+    if store.delete_reminder(reminder_id, interaction.user.id):
+        await interaction.response.send_message(f"Reminder **#{reminder_id}** deleted.", ephemeral=True)
+    else:
+        await interaction.response.send_message("Reminder not found.", ephemeral=True)
+
+
+shop_group = app_commands.Group(name="shop", description="Economy shop")
+
+
+@shop_group.command(name="list", description="List items for sale")
+async def shop_list(interaction: discord.Interaction) -> None:
+    items = store.list_shop_items(interaction.guild_id)
+    lines = "\n".join(
+        f"**{row['name']}** — {row['price']:,} credits"
+        + (f" ({row['stock']} left)" if int(row['stock']) >= 0 else "")
+        + (f" — {row['description']}" if row["description"] else "")
+        for row in items
+    ) or "The shop is empty."
+    await interaction.response.send_message(
+        embed=discord.Embed(title="Shop", description=lines[:4000]), ephemeral=True
+    )
+
+
+@shop_group.command(name="add", description="Add an item to the shop")
+@app_commands.checks.has_permissions(manage_guild=True)
+@app_commands.describe(
+    name="Item name", price="Price in credits", role_id="Optional role to grant on purchase",
+    description="Optional description", stock="Optional limited stock (-1 for unlimited)",
+)
+async def shop_add(
+    interaction: discord.Interaction,
+    name: str,
+    price: app_commands.Range[int, 1],
+    role_id: discord.Role | None = None,
+    description: str = "",
+    stock: app_commands.Range[int, -1] = -1,
+) -> None:
+    store.add_shop_item(
+        interaction.guild_id, name, description, price,
+        (role_id.id if role_id else None), stock,
+    )
+    await interaction.response.send_message(f"Added **{name}** to the shop.", ephemeral=True)
+
+
+@shop_group.command(name="remove", description="Remove an item from the shop")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def shop_remove(interaction: discord.Interaction, item_id: int) -> None:
+    if store.delete_shop_item(interaction.guild_id, item_id):
+        await interaction.response.send_message(f"Removed item **#{item_id}**.", ephemeral=True)
+    else:
+        await interaction.response.send_message("Item not found.", ephemeral=True)
+
+
+@shop_group.command(name="buy", description="Purchase an item from the shop")
+@app_commands.describe(item_id="The item number from /shop list")
+async def shop_buy(interaction: discord.Interaction, item_id: int) -> None:
+    if not isinstance(interaction.user, discord.Member):
+        return
+    item = store.get_shop_item(interaction.guild_id, item_id)
+    if not item:
+        return await interaction.response.send_message("Item not found.", ephemeral=True)
+    if int(item["stock"]) == 0:
+        return await interaction.response.send_message("That item is out of stock.", ephemeral=True)
+    member = store.get_member(interaction.guild_id, interaction.user.id, str(interaction.user))
+    if int(member["balance"]) < int(item["price"]):
+        return await interaction.response.send_message(
+            f"You need **{item['price']:,}** credits; you have **{member['balance']:,}**.", ephemeral=True
+        )
+    new_balance = store.change_balance(
+        interaction.guild_id, interaction.user.id, str(interaction.user), -int(item["price"])
+    )
+    store.add_to_inventory(interaction.guild_id, interaction.user.id, item_id)
+    if int(item["stock"]) > 0:
+        with store.connect() as db:
+            db.execute(
+                "UPDATE shop_items SET stock=stock-1 WHERE id=?", (item["id"],)
+            )
+    role = None
+    if item["role_id"]:
+        role = interaction.guild.get_role(int(item["role_id"]))
+        if role:
+            await interaction.user.add_roles(role, reason="Response shop purchase")
+    reply = f"Purchased **{item['name']}** for **{item['price']:,}** credits. Balance: **{new_balance:,}**."
+    if role:
+        reply += f" You got the {role.mention} role."
+    await interaction.response.send_message(reply)
+
+
+@shop_group.command(name="inventory", description="Show items you own")
+async def shop_inventory(interaction: discord.Interaction) -> None:
+    items = store.inventory_for(interaction.guild_id, interaction.user.id)
+    lines = "\n".join(
+        f"**{row['name']}** ×{row['quantity']}"
+        + (f" — {row['description']}" if row["description"] else "")
+        for row in items
+    ) or "Your inventory is empty."
+    await interaction.response.send_message(
+        embed=discord.Embed(title="Your inventory", description=lines[:4000]), ephemeral=True
+    )
+
+
+bot.tree.add_command(sticky_group)
+bot.tree.add_command(custom_cmd_group)
+bot.tree.add_command(shop_group)
 
 
 @bot.tree.error

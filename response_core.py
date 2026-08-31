@@ -151,6 +151,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "support_roles": [],
         "panel_channel": None,
         "welcome_message": "Thanks for contacting support. Describe how we can help.",
+        "transcript_channel": None,
     },
     "moderation": {
         "dm_on_action": True,
@@ -183,6 +184,15 @@ DEFAULT_CONFIG: dict[str, Any] = {
     },
     "giveaways": {"enabled": True, "role_entries": {}},
     "scheduled_messages": {"enabled": True},
+    "sticky": {"enabled": True, "emoji": "📌"},
+    "starboard": {
+        "enabled": False,
+        "channel": None,
+        "threshold": 3,
+        "emoji": "⭐",
+    },
+    "auto_roles": {"enabled": False, "roles": []},
+    "custom_commands": {"enabled": True, "prefix": "!"},
 }
 
 
@@ -436,6 +446,81 @@ MYSQL_SCHEMA = (
         UNIQUE KEY sfx_guild_name (guild_id, name)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
     """,
+    """
+    CREATE TABLE IF NOT EXISTS stickied_messages (
+        guild_id BIGINT UNSIGNED NOT NULL,
+        channel_id BIGINT UNSIGNED NOT NULL,
+        message_content TEXT NOT NULL,
+        embed_json TEXT,
+        PRIMARY KEY (channel_id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS custom_commands (
+        id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+        guild_id BIGINT UNSIGNED NOT NULL,
+        trigger VARCHAR(100) NOT NULL,
+        response TEXT NOT NULL,
+        enabled TINYINT(1) NOT NULL DEFAULT 1,
+        UNIQUE KEY cc_guild_trigger (guild_id, trigger),
+        KEY cc_guild (guild_id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS starboard (
+        source_message_id BIGINT UNSIGNED NOT NULL,
+        guild_id BIGINT UNSIGNED NOT NULL,
+        channel_id BIGINT UNSIGNED NOT NULL,
+        star_message_id BIGINT UNSIGNED,
+        stars INT NOT NULL DEFAULT 0,
+        PRIMARY KEY (source_message_id),
+        KEY starboard_guild (guild_id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS reminders (
+        id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+        user_id BIGINT UNSIGNED NOT NULL,
+        channel_id BIGINT UNSIGNED NOT NULL,
+        guild_id BIGINT UNSIGNED,
+        content TEXT NOT NULL,
+        send_at BIGINT NOT NULL,
+        created_at BIGINT NOT NULL,
+        enabled TINYINT(1) NOT NULL DEFAULT 1,
+        KEY reminders_due (enabled, send_at)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS shop_items (
+        id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+        guild_id BIGINT UNSIGNED NOT NULL,
+        name VARCHAR(100) NOT NULL,
+        description TEXT NOT NULL,
+        price BIGINT NOT NULL,
+        role_id BIGINT UNSIGNED,
+        stock INT NOT NULL DEFAULT -1,
+        UNIQUE KEY shop_guild_name (guild_id, name),
+        KEY shop_guild (guild_id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS inventory (
+        guild_id BIGINT UNSIGNED NOT NULL,
+        user_id BIGINT UNSIGNED NOT NULL,
+        item_id BIGINT UNSIGNED NOT NULL,
+        quantity INT NOT NULL DEFAULT 1,
+        PRIMARY KEY (guild_id, user_id, item_id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS afk (
+        guild_id BIGINT UNSIGNED NOT NULL,
+        user_id BIGINT UNSIGNED NOT NULL,
+        reason TEXT NOT NULL,
+        afk_at BIGINT NOT NULL,
+        PRIMARY KEY (guild_id, user_id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+    """,
 )
 
 
@@ -536,6 +621,65 @@ CREATE INDEX IF NOT EXISTS members_leaderboard ON members(guild_id, xp DESC);
 CREATE INDEX IF NOT EXISTS schedules_due ON scheduled_messages(enabled, send_at);
 CREATE INDEX IF NOT EXISTS event_logs_guild ON event_logs(guild_id, id);
 CREATE INDEX IF NOT EXISTS cases_user ON moderation_cases(guild_id, user_id);
+CREATE TABLE IF NOT EXISTS stickied_messages (
+    guild_id INTEGER NOT NULL,
+    channel_id INTEGER NOT NULL PRIMARY KEY,
+    message_content TEXT NOT NULL,
+    embed_json TEXT
+);
+CREATE TABLE IF NOT EXISTS custom_commands (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_id INTEGER NOT NULL,
+    trigger TEXT NOT NULL,
+    response TEXT NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    UNIQUE(guild_id, trigger)
+);
+CREATE TABLE IF NOT EXISTS starboard (
+    source_message_id INTEGER NOT NULL PRIMARY KEY,
+    guild_id INTEGER NOT NULL,
+    channel_id INTEGER NOT NULL,
+    star_message_id INTEGER,
+    stars INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS reminders (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    channel_id INTEGER NOT NULL,
+    guild_id INTEGER,
+    content TEXT NOT NULL,
+    send_at INTEGER NOT NULL,
+    created_at INTEGER NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 1
+);
+CREATE TABLE IF NOT EXISTS shop_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_id INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    description TEXT NOT NULL DEFAULT '',
+    price INTEGER NOT NULL,
+    role_id INTEGER,
+    stock INTEGER NOT NULL DEFAULT -1,
+    UNIQUE(guild_id, name)
+);
+CREATE TABLE IF NOT EXISTS inventory (
+    guild_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    item_id INTEGER NOT NULL,
+    quantity INTEGER NOT NULL DEFAULT 1,
+    PRIMARY KEY (guild_id, user_id, item_id)
+);
+CREATE TABLE IF NOT EXISTS afk (
+    guild_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    reason TEXT NOT NULL DEFAULT '',
+    afk_at INTEGER NOT NULL,
+    PRIMARY KEY (guild_id, user_id)
+);
+CREATE INDEX IF NOT EXISTS custom_cmds_guild ON custom_commands(guild_id);
+CREATE INDEX IF NOT EXISTS reminders_due ON reminders(enabled, send_at);
+CREATE INDEX IF NOT EXISTS shop_guild ON shop_items(guild_id);
+CREATE INDEX IF NOT EXISTS starboard_guild ON starboard(guild_id);
 """
 
 
@@ -1031,6 +1175,323 @@ def delete_sound_effect(guild_id: int, sound_id: int) -> dict[str, Any] | None:
 def sound_file_name(original_name: str) -> str:
     suffix = Path(original_name).suffix.lower()
     return f"{uuid.uuid4().hex}{suffix}"
+
+
+def get_stickied(guild_id: int) -> list[dict[str, Any]]:
+    with connect() as db:
+        rows = db.execute(
+            "SELECT channel_id, message_content, embed_json FROM stickied_messages WHERE guild_id=?",
+            (guild_id,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def set_stickied(
+    guild_id: int, channel_id: int, content: str, embed_json: str | None
+) -> None:
+    with connect() as db:
+        db.execute(
+            dialect(
+                """
+                INSERT INTO stickied_messages(guild_id, channel_id, message_content, embed_json)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(channel_id) DO UPDATE SET
+                    message_content=excluded.message_content, embed_json=excluded.embed_json
+                """,
+                """
+                INSERT INTO stickied_messages(guild_id, channel_id, message_content, embed_json)
+                VALUES (?, ?, ?, ?)
+                ON DUPLICATE KEY UPDATE
+                    message_content=VALUES(message_content), embed_json=VALUES(embed_json)
+                """,
+            ),
+            (guild_id, channel_id, content, embed_json),
+        )
+
+
+def unstick(guild_id: int, channel_id: int) -> None:
+    with connect() as db:
+        db.execute(
+            "DELETE FROM stickied_messages WHERE guild_id=? AND channel_id=?",
+            (guild_id, channel_id),
+        )
+
+
+def list_custom_commands(guild_id: int) -> list[dict[str, Any]]:
+    with connect() as db:
+        rows = db.execute(
+            "SELECT id, trigger, response, enabled FROM custom_commands WHERE guild_id=? ORDER BY trigger",
+            (guild_id,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def get_custom_command(guild_id: int, trigger: str) -> dict[str, Any] | None:
+    with connect() as db:
+        row = db.execute(
+            "SELECT id, trigger, response, enabled FROM custom_commands WHERE guild_id=? AND trigger=?",
+            (guild_id, trigger.lower()),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def set_custom_command(
+    guild_id: int, trigger: str, response: str, enabled: bool = True
+) -> bool:
+    with connect() as db:
+        cursor = db.execute(
+            dialect(
+                """
+                INSERT INTO custom_commands(guild_id, trigger, response, enabled) VALUES (?, ?, ?, ?)
+                ON CONFLICT(guild_id, trigger) DO UPDATE SET
+                    response=excluded.response, enabled=excluded.enabled
+                """,
+                """
+                INSERT INTO custom_commands(guild_id, trigger, response, enabled) VALUES (?, ?, ?, ?)
+                ON DUPLICATE KEY UPDATE response=VALUES(response), enabled=VALUES(enabled)
+                """,
+            ),
+            (guild_id, trigger.lower(), response, int(enabled)),
+        )
+        return bool(cursor.rowcount or 1)
+
+
+def delete_custom_command(guild_id: int, trigger: str) -> bool:
+    with connect() as db:
+        cursor = db.execute(
+            "DELETE FROM custom_commands WHERE guild_id=? AND trigger=?",
+            (guild_id, trigger.lower()),
+        )
+        return bool(cursor.rowcount)
+
+
+def starboard_row(source_message_id: int) -> dict[str, Any] | None:
+    with connect() as db:
+        row = db.execute(
+            "SELECT * FROM starboard WHERE source_message_id=?",
+            (source_message_id,),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def starboard_add_or_update(
+    source_message_id: int, guild_id: int, channel_id: int, stars: int, star_message_id: int | None
+) -> None:
+    with connect() as db:
+        db.execute(
+            dialect(
+                """
+                INSERT INTO starboard(source_message_id, guild_id, channel_id, stars, star_message_id)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(source_message_id) DO UPDATE SET
+                    stars=excluded.stars, star_message_id=excluded.star_message_id
+                """,
+                """
+                INSERT INTO starboard(source_message_id, guild_id, channel_id, stars, star_message_id)
+                VALUES (?, ?, ?, ?, ?)
+                ON DUPLICATE KEY UPDATE stars=VALUES(stars), star_message_id=VALUES(star_message_id)
+                """,
+            ),
+            (source_message_id, guild_id, channel_id, stars, star_message_id),
+        )
+
+
+def starboard_remove(source_message_id: int) -> None:
+    with connect() as db:
+        db.execute("DELETE FROM starboard WHERE source_message_id=?", (source_message_id,))
+
+
+def list_reminders(user_id: int, enabled: bool = True) -> list[dict[str, Any]]:
+    with connect() as db:
+        rows = db.execute(
+            "SELECT id, user_id, channel_id, guild_id, content, send_at, created_at "
+            "FROM reminders WHERE user_id=? AND enabled=? ORDER BY send_at",
+            (user_id, int(enabled)),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def add_reminder(
+    user_id: int,
+    channel_id: int,
+    guild_id: int | None,
+    content: str,
+    send_at: int,
+) -> int:
+    now = int(time.time())
+    with connect() as db:
+        cursor = db.execute(
+            "INSERT INTO reminders(user_id, channel_id, guild_id, content, send_at, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (user_id, channel_id, guild_id, content[:2000], send_at, now),
+        )
+        return int(cursor.lastrowid)
+
+
+def delete_reminder(reminder_id: int, user_id: int) -> bool:
+    with connect() as db:
+        cursor = db.execute(
+            "DELETE FROM reminders WHERE id=? AND user_id=?", (reminder_id, user_id)
+        )
+        return bool(cursor.rowcount)
+
+
+def list_shop_items(guild_id: int) -> list[dict[str, Any]]:
+    with connect() as db:
+        rows = db.execute(
+            "SELECT * FROM shop_items WHERE guild_id=? ORDER BY price",
+            (guild_id,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def get_shop_item(guild_id: int, item_id: int) -> dict[str, Any] | None:
+    with connect() as db:
+        row = db.execute(
+            "SELECT * FROM shop_items WHERE guild_id=? AND id=?", (guild_id, item_id)
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def add_shop_item(
+    guild_id: int,
+    name: str,
+    description: str,
+    price: int,
+    role_id: int | None,
+    stock: int,
+) -> bool:
+    with connect() as db:
+        cursor = db.execute(
+            dialect(
+                """
+                INSERT INTO shop_items(guild_id, name, description, price, role_id, stock)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(guild_id, name) DO UPDATE SET
+                    description=excluded.description, price=excluded.price,
+                    role_id=excluded.role_id, stock=excluded.stock
+                """,
+                """
+                INSERT INTO shop_items(guild_id, name, description, price, role_id, stock)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON DUPLICATE KEY UPDATE description=VALUES(description), price=VALUES(price),
+                    role_id=VALUES(role_id), stock=VALUES(stock)
+                """,
+            ),
+            (guild_id, name.lower()[:100], description[:1000], price, role_id, stock),
+        )
+        return bool(cursor.rowcount or 1)
+
+
+def delete_shop_item(guild_id: int, item_id: int) -> bool:
+    with connect() as db:
+        cursor = db.execute(
+            "DELETE FROM shop_items WHERE guild_id=? AND id=?", (guild_id, item_id)
+        )
+        return bool(cursor.rowcount)
+
+
+def inventory_for(guild_id: int, user_id: int) -> list[dict[str, Any]]:
+    with connect() as db:
+        rows = db.execute(
+            "SELECT i.item_id, i.quantity, s.name, s.description, s.role_id "
+            "FROM inventory i JOIN shop_items s ON s.id=i.item_id "
+            "WHERE i.guild_id=? AND i.user_id=? ORDER BY s.name",
+            (guild_id, user_id),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def add_to_inventory(guild_id: int, user_id: int, item_id: int, quantity: int = 1) -> None:
+    with connect() as db:
+        db.execute(
+            dialect(
+                """
+                INSERT INTO inventory(guild_id, user_id, item_id, quantity) VALUES (?, ?, ?, ?)
+                ON CONFLICT(guild_id, user_id, item_id) DO UPDATE SET quantity=quantity+excluded.quantity
+                """,
+                """
+                INSERT INTO inventory(guild_id, user_id, item_id, quantity) VALUES (?, ?, ?, ?)
+                ON DUPLICATE KEY UPDATE quantity=quantity+VALUES(quantity)
+                """,
+            ),
+            (guild_id, user_id, item_id, quantity),
+        )
+
+
+def consume_inventory(guild_id: int, user_id: int, item_id: int) -> bool:
+    with connect() as db:
+        row = db.execute(
+            "SELECT quantity FROM inventory WHERE guild_id=? AND user_id=? AND item_id=?",
+            (guild_id, user_id, item_id),
+        ).fetchone()
+        if not row or int(row["quantity"]) <= 0:
+            return False
+        if int(row["quantity"]) == 1:
+            db.execute(
+                "DELETE FROM inventory WHERE guild_id=? AND user_id=? AND item_id=?",
+                (guild_id, user_id, item_id),
+            )
+        else:
+            db.execute(
+                "UPDATE inventory SET quantity=quantity-1 WHERE guild_id=? AND user_id=? AND item_id=?",
+                (guild_id, user_id, item_id),
+            )
+        return True
+
+
+def set_afk(guild_id: int, user_id: int, reason: str) -> None:
+    with connect() as db:
+        db.execute(
+            dialect(
+                """
+                INSERT INTO afk(guild_id, user_id, reason, afk_at) VALUES (?, ?, ?, ?)
+                ON CONFLICT(guild_id, user_id) DO UPDATE SET reason=excluded.reason, afk_at=excluded.afk_at
+                """,
+                """
+                INSERT INTO afk(guild_id, user_id, reason, afk_at) VALUES (?, ?, ?, ?)
+                ON DUPLICATE KEY UPDATE reason=VALUES(reason), afk_at=VALUES(afk_at)
+                """,
+            ),
+            (guild_id, user_id, reason[:1000], int(time.time())),
+        )
+
+
+def get_afk(guild_id: int, user_id: int) -> dict[str, Any] | None:
+    with connect() as db:
+        row = db.execute(
+            "SELECT * FROM afk WHERE guild_id=? AND user_id=?", (guild_id, user_id)
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def clear_afk(guild_id: int, user_id: int) -> bool:
+    with connect() as db:
+        cursor = db.execute("DELETE FROM afk WHERE guild_id=? AND user_id=?", (guild_id, user_id))
+        return bool(cursor.rowcount)
+
+
+def member_count(guild_id: int) -> int:
+    with connect() as db:
+        row = db.execute(
+            "SELECT COUNT(*) AS count FROM members WHERE guild_id=?", (guild_id,)
+        ).fetchone()
+    return int(row["count"]) if row else 0
+
+
+def activity_series(guild_id: int, days: int = 14) -> list[dict[str, int]]:
+    """Per-day member activity counts for the last N days."""
+    with connect() as db:
+        rows = db.execute(
+            "SELECT event_type, detail, created_at FROM audit_events "
+            "WHERE guild_id=? AND created_at>=? ORDER BY created_at",
+            (guild_id, int(time.time()) - days * 86400),
+        ).fetchall()
+    buckets: dict[str, int] = {}
+    for row in rows:
+        day = ((int(row["created_at"]) // 86400) * 86400)
+        buckets[str(day)] = buckets.get(str(day), 0) + 1
+    return [{"date": int(key), "count": value} for key, value in sorted(buckets.items())]
 
 
 init_db()

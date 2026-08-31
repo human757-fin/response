@@ -157,6 +157,11 @@ PAGE = r"""<!doctype html>
         <button data-page="antinuke">⚿ &nbsp; Anti-nuke</button>
         <button data-page="sfx">♫ &nbsp; Voice & SFX</button>
         <button data-page="messages">▤ &nbsp; Messages</button>
+        <div class="nav-section">Customization</div>
+        <button data-page="commands">⚙ &nbsp; Custom Commands</button>
+        <button data-page="shop">🛒 &nbsp; Shop</button>
+        <button data-page="reactionroles">😀 &nbsp; Reaction Roles</button>
+        <button data-page="stickers">📌 &nbsp; Sticky & Starboard</button>
       </nav>
       <div class="server-select"><label><span class="field-name">Discord server</span><select id="guild"></select></label></div>
     </aside>
@@ -203,7 +208,8 @@ PAGE = r"""<!doctype html>
         state.dirty=false;updateSaveButton();toast("Settings saved")}catch(e){toast(e.message,true)}
       finally{button.disabled=false}});
     function title(){return {dashboard:"Overview",leveling:"Leveling",economy:"Economy",giveaways:"Giveaways",welcome:"Welcome & boost",
-      moderation:"Moderation",eventlogs:"Event logs",antinuke:"Anti-nuke",sfx:"Voice & sound effects",messages:"Scheduled messages"}[state.page]}
+      moderation:"Moderation",eventlogs:"Event logs",antinuke:"Anti-nuke",sfx:"Voice & sound effects",messages:"Scheduled messages",
+      commands:"Custom commands",shop:"Shop",reactionroles:"Reaction roles",stickers:"Sticky & starboard"}[state.page]}
     async function render(){
       if(state.page!=="giveaways"&&state.giveawayTimer){clearTimeout(state.giveawayTimer);state.giveawayTimer=null}
       $("#pageTitle").textContent=title();$("#serverName").textContent=state.guild?.name||"No server selected";
@@ -214,16 +220,20 @@ PAGE = r"""<!doctype html>
       if(state.page==="moderation")return renderModeration();
       if(state.page==="eventlogs")return renderEventLogs();
       if(state.page==="sfx")return renderSfx();
+      if(state.page==="leveling")return renderLeveling();
+      if(state.page==="commands")return renderCommands();
+      if(state.page==="shop")return renderShop();
+      if(state.page==="reactionroles")return renderReactionRoles();
+      if(state.page==="stickers")return renderSticky();
       renderSettings(pageMap[state.page]||[]);
     }
-    async function renderDashboard(){
+    async function renderLeveling(){
       const d=await api(`/api/guilds/${state.guild.guild_id}/dashboard`);
-      $("#content").innerHTML=`<div class="grid">
-        ${metric("Tracked members",d.tracked_members)}${metric("Total XP",Number(d.total_xp).toLocaleString())}
-        ${metric("Economy balance",Number(d.economy_total).toLocaleString())}${metric("Active giveaways",d.active_giveaways)}
-      </div><div class="split"><div class="card"><h2>XP leaderboard</h2>${leaderboard(d.leaderboard)}</div>
-      <div class="card"><h2>Recent activity</h2>${d.events.length?d.events.map(x=>`<div class="event"><b>${esc(x.event_type.replaceAll("_"," "))}</b>
-        <div>${esc(x.detail)}</div><small>${new Date(x.created_at*1000).toLocaleString()}</small></div>`).join(""):'<div class="empty">No activity logged yet.</div>'}</div></div>`;
+      const lbTable=d.leaderboard.length?`<table><thead><tr><th>#</th><th>Member</th><th>Level</th><th>XP</th><th>Balance</th></tr></thead><tbody>
+        ${d.leaderboard.map((r,i)=>`<tr><td>${i+1}</td><td>${esc(r.username)}</td><td>${r.level}</td><td>${Number(r.xp).toLocaleString()}</td><td>${Number(r.balance).toLocaleString()}</td></tr>`).join("")}</tbody></table>`:
+        '<div class="empty">Members appear after earning XP.</div>'};
+      $("#content").innerHTML=`<div class="card" style="margin-bottom:16px"><h2>XP leaderboard</h2>${lbTable}</div>`+settingsMarkup(["leveling"]);
+      bindSettings();
     }
     async function renderEventLogs(){state.logSearch="";await loadEventLogs(true)}
     async function loadEventLogs(reset){
@@ -335,6 +345,105 @@ PAGE = r"""<!doctype html>
           <td>${esc(c.reason)}</td><td>${new Date(c.created_at*1000).toLocaleString()}</td></tr>`).join("")}</tbody></table>`:
           '<div class="empty">Moderation cases will appear here.</div>'}</div>`;bindSettings();
     }
+    async function renderCommands(){
+      const d=await api(`/api/guilds/${state.guild.guild_id}/commands`);
+      const cfg=state.config.custom_commands;
+      $("#content").innerHTML=settingsMarkup(["custom_commands"])+`<div class="card"><h2>Custom text commands</h2>
+        <form id="cmdForm" class="toolbar">
+          <label><span class="field-name">Trigger</span><input name="name" pattern="[a-zA-Z0-9]{1,32}" placeholder="ping" required></label>
+          <label><span class="field-name">Response</span><input name="response" placeholder="pong!" required></label>
+          <button class="primary">Create command</button></form>
+        <div class="muted">Trigger with ${esc(cfg.prefix||"!")}prefix in Discord, e.g. ${esc(cfg.prefix||"!")}ping</div>
+        ${d.commands.length?`<table><thead><tr><th>Trigger</th><th>Response</th><th>Enabled</th><th></th></tr></thead><tbody>
+        ${d.commands.map(c=>`<tr><td>${esc(cfg.prefix||"!")}${esc(c.trigger)}</td><td>${esc(c.response)}</td>
+          <td>${c.enabled?'<span class="source-pill">on</span>':'<span class="source-pill">off</span>'}</td>
+          <td><button class="danger" data-cmd="${esc(c.trigger)}">Delete</button></td></tr>`).join("")}</tbody></table>`:
+          '<div class="empty">No custom commands yet. Create one above.</div>'}</div>`;
+      $("#cmdForm").addEventListener("submit",async e=>{e.preventDefault();const f=new FormData(e.target);
+        try{await api(`/api/guilds/${state.guild.guild_id}/commands`,{method:"POST",body:JSON.stringify({name:f.get("name"),response:f.get("response")})});
+          toast("Command saved");renderCommands()}catch(err){toast(err.message,true)}});
+      document.querySelectorAll("[data-cmd]").forEach(b=>b.addEventListener("click",async()=>{
+        await api(`/api/guilds/${state.guild.guild_id}/commands/${encodeURIComponent(b.dataset.cmd)}`,{method:"DELETE"});
+        toast("Command deleted");renderCommands()}));
+    }
+    async function renderShop(){
+      const d=await api(`/api/guilds/${state.guild.guild_id}/shop`);
+      $("#content").innerHTML=`<div class="card"><h2>Economy shop</h2>
+        <form id="shopForm" class="toolbar">
+          <label><span class="field-name">Name</span><input name="name" required></label>
+          <label><span class="field-name">Price (credits)</span><input name="price" type="number" min="1" required></label>
+          <label><span class="field-name">Role ID (optional)</span><input name="role_id" inputmode="numeric"></label>
+          <label><span class="field-name">Description</span><input name="description"></label>
+          <label><span class="field-name">Stock (-1 unlimited)</span><input name="stock" type="number" value="-1"></label>
+          <button class="primary">Add item</button></form>
+        ${d.items.length?`<table><thead><tr><th>Name</th><th>Price</th><th>Stock</th><th>Description</th><th></th></tr></thead><tbody>
+        ${d.items.map(i=>`<tr><td><b>${esc(i.name)}</b></td><td>${i.price.toLocaleString()}</td>
+          <td>${i.stock<0?'∞':i.stock}</td><td>${esc(i.description||"")}</td>
+          <td><button class="danger" data-item="${i.id}">Delete</button></td></tr>`).join("")}</tbody></table>`:
+          '<div class="empty">Shop is empty.</div>'}</div>`;
+      $("#shopForm").addEventListener("submit",async e=>{e.preventDefault();const f=new FormData(e.target);
+        try{await api(`/api/guilds/${state.guild.guild_id}/shop`,{method:"POST",body:JSON.stringify({
+          name:f.get("name"),price:Number(f.get("price")),role_id:f.get("role_id"),description:f.get("description"),stock:Number(f.get("stock"))})});
+          toast("Item saved");renderShop()}catch(err){toast(err.message,true)}});
+      document.querySelectorAll("[data-item]").forEach(b=>b.addEventListener("click",async()=>{
+        await api(`/api/guilds/${state.guild.guild_id}/shop/${b.dataset.item}`,{method:"DELETE"});
+        toast("Item deleted");renderShop()}));
+    }
+    async function renderReactionRoles(){
+      const d=await api(`/api/guilds/${state.guild.guild_id}/reaction-roles`);
+      $("#content").innerHTML=`<div class="card"><h2>Reaction roles</h2>
+        <form id="rrForm" class="toolbar">
+          <label><span class="field-name">Message ID</span><input name="message_id" inputmode="numeric" required></label>
+          <label><span class="field-name">Emoji</span><input name="emoji" placeholder="✅" required></label>
+          <label><span class="field-name">Role ID</span><input name="role_id" inputmode="numeric" required></label>
+          <button class="primary">Add binding</button></form>
+        ${d.roles.length?`<table><thead><tr><th>Message</th><th>Emoji</th><th>Role</th><th></th></tr></thead><tbody>
+        ${d.roles.map(r=>`<tr><td>${r.message_id}</td><td>${esc(r.emoji)}</td><td>${r.role_id}</td>
+          <td><button class="danger" data-rr="${r.message_id}|${encodeURIComponent(r.emoji)}|${r.role_id}">Delete</button></td></tr>`).join("")}</tbody></table>`:
+          '<div class="empty">No reaction roles configured. Post a message in Discord and add bindings above.</div>'}</div>`;
+      $("#rrForm").addEventListener("submit",async e=>{e.preventDefault();const f=new FormData(e.target);
+        try{await api(`/api/guilds/${state.guild.guild_id}/reaction-roles`,{method:"POST",body:JSON.stringify({
+          message_id:f.get("message_id"),emoji:f.get("emoji"),role_id:f.get("role_id")})});
+          toast("Reaction role saved");renderReactionRoles()}catch(err){toast(err.message,true)}});
+      document.querySelectorAll("[data-rr]").forEach(b=>b.addEventListener("click",async()=>{
+        const[m,e,r]=b.dataset.rr.split("|");
+        await api(`/api/guilds/${state.guild.guild_id}/reaction-roles/${m}/${decodeURIComponent(e)}/${r}`,{method:"DELETE"});
+        toast("Reaction role deleted");renderReactionRoles()}));
+    }
+    async function renderSticky(){
+      const stickies=await api(`/api/guilds/${state.guild.guild_id}/stickies`).then(x=>x.stickies).catch(()=>[]);
+      $("#content").innerHTML=settingsMarkup(["sticky","starboard"])+`<div class="card"><h2>Sticky messages</h2>
+        ${stickies.length?`<table><thead><tr><th>Channel</th><th>Content</th><th></th></tr></thead><tbody>
+        ${stickies.map(s=>`<tr><td>${s.channel_id}</td><td>${esc(s.message_content)}</td>
+          <td><button class="danger" data-sticky="${s.channel_id}">Remove</button></td></tr>`).join("")}</tbody></table>`:
+          '<div class="empty">No sticky messages set. Use /sticky set in Discord to pin a message.'}</div>`;
+      document.querySelectorAll("[data-sticky]").forEach(b=>b.addEventListener("click",async()=>{
+        await api(`/api/guilds/${state.guild.guild_id}/stickies/${b.dataset.sticky}`,{method:"DELETE"});
+        toast("Sticky removed");renderSticky()}));
+    }
+    async function renderDashboard(){
+      const d=await api(`/api/guilds/${state.guild.guild_id}/dashboard`);
+      let chart="";
+      try{const act=await api(`/api/guilds/${state.guild.guild_id}/activity?days=14`);chart=activityChart(act.series)}catch(e){}
+      $("#content").innerHTML=`<div class="grid">
+        ${metric("Tracked members",d.tracked_members)}${metric("Total XP",Number(d.total_xp).toLocaleString())}
+        ${metric("Economy balance",Number(d.economy_total).toLocaleString())}${metric("Active giveaways",d.active_giveaways)}
+      </div>${chart?`<div class="card" style="margin-top:16px"><h2>Activity — last 14 days</h2>${chart}</div>`:""}
+      <div class="split"><div class="card"><h2>XP leaderboard</h2>${leaderboard(d.leaderboard)}</div>
+      <div class="card"><h2>Recent activity</h2>${d.events.length?d.events.map(x=>`<div class="event"><b>${esc(x.event_type.replaceAll("_"," "))}</b>
+        <div>${esc(x.detail)}</div><small>${new Date(x.created_at*1000).toLocaleString()}</small></div>`).join(""):'<div class="empty">No activity logged yet.</div>'}</div></div>`;
+    }
+    function activityChart(series){
+      const max=Math.max(1,...series.map(p=>p.count));
+      const bars=series.map(p=>{
+        const h=Math.max(3,Math.round((p.count/max)*120));
+        const date=new Date(p.date*1000).toLocaleDateString(undefined,{month:"short",day:"numeric"});
+        return `<div title="${date}: ${p.count}" style="flex:1;display:flex;flex-direction:column;justify-content:flex-end;height:150px;gap:4px"}>
+          <div style="height:${h}px;background:linear-gradient(180deg,var(--accent),#a65cff);border-radius:5px 5px 0 0;opacity:.9"></div>
+          <small style="text-align:center;color:var(--muted);font-size:10px">${date}</small></div>`;
+      }).join("");
+      return `<div style="display:flex;align-items:flex-end;gap:4px">${bars}</div>`;
+    }
     async function renderSfx(){
       const d=await api(`/api/guilds/${state.guild.guild_id}/sfx`);
       $("#content").innerHTML=settingsMarkup(["voice"])+`<div class="card"><h2>Sound-effect library</h2>
@@ -433,6 +542,8 @@ async def access_log_middleware(request: web.Request, handler: Any) -> web.Strea
 @web.middleware
 async def auth_middleware(request: web.Request, handler: Any) -> web.StreamResponse:
     public = request.path in {"/", "/health", "/api/login"}
+    if request.path.startswith("/widget/"):
+        public = True
     if not public and not authenticated(request):
         log.warning("Rejected unauthorized web request from %s to %s", client_ip(request), request.path)
         return json_response({"error": "Unauthorized"}, 401)
@@ -765,6 +876,193 @@ async def schedule_delete(request: web.Request) -> web.Response:
     return json_response({"ok": True})
 
 
+async def custom_commands_endpoint(request: web.Request) -> web.Response:
+    target = guild_id(request)
+    if request.method == "POST":
+        try:
+            body = await request.json()
+        except json.JSONDecodeError:
+            return json_response({"error": "Invalid JSON"}, 400)
+        trigger = str(body.get("name") or "").strip().lower()
+        response_text = str(body.get("response") or "").strip()
+        if not trigger.isalnum() or len(trigger) > 32 or not response_text:
+            return json_response({"error": "Name must be alphanumeric and a response is required"}, 400)
+        store.set_custom_command(target, trigger, response_text)
+        record_panel_event(
+            request, target, "Web panel custom command saved",
+            f"Custom command `{trigger}` was saved.",
+        )
+        return json_response({"ok": True}, 201)
+    return json_response({"commands": store.list_custom_commands(target)})
+
+
+async def custom_command_delete(request: web.Request) -> web.Response:
+    target = guild_id(request)
+    trigger = request.match_info["trigger"].lower()
+    if store.delete_custom_command(target, trigger):
+        return json_response({"ok": True})
+    return json_response({"error": "Command not found"}, 404)
+
+
+async def shop_endpoint(request: web.Request) -> web.Response:
+    target = guild_id(request)
+    if request.method == "POST":
+        try:
+            body = await request.json()
+        except json.JSONDecodeError:
+            return json_response({"error": "Invalid JSON"}, 400)
+        try:
+            price = int(body["price"])
+            stock = int(body.get("stock", -1))
+        except (KeyError, TypeError, ValueError):
+            return json_response({"error": "Price and stock must be numbers"}, 400)
+        if price < 1 or stock < -1:
+            return json_response({"error": "Invalid price or stock"}, 400)
+        name = str(body.get("name") or "").strip()
+        if not name:
+            return json_response({"error": "Item name is required"}, 400)
+        role_value = str(body.get("role_id") or "").strip()
+        role_id = int(role_value) if role_value.isdigit() else None
+        store.add_shop_item(
+            target, name, str(body.get("description") or "").strip(),
+            price, role_id, stock,
+        )
+        record_panel_event(
+            request, target, "Web panel shop updated",
+            f"Shop item `{name}` was saved.",
+        )
+        return json_response({"ok": True}, 201)
+    return json_response({"items": store.list_shop_items(target)})
+
+
+async def shop_delete(request: web.Request) -> web.Response:
+    target = guild_id(request)
+    try:
+        item_id = int(request.match_info["item_id"])
+    except ValueError:
+        return json_response({"error": "Invalid item ID"}, 400)
+    if store.delete_shop_item(target, item_id):
+        return json_response({"ok": True})
+    return json_response({"error": "Item not found"}, 404)
+
+
+async def reaction_roles_endpoint(request: web.Request) -> web.Response:
+    target = guild_id(request)
+    if request.method == "POST":
+        try:
+            body = await request.json()
+        except json.JSONDecodeError:
+            return json_response({"error": "Invalid JSON"}, 400)
+        try:
+            message_id = int(body["message_id"])
+            role_id = int(body["role_id"])
+        except (KeyError, TypeError, ValueError):
+            return json_response({"error": "Message and role IDs must be numbers"}, 400)
+        emoji = str(body.get("emoji") or "").strip()
+        if not emoji:
+            return json_response({"error": "An emoji is required"}, 400)
+        with store.connect() as db:
+            db.execute(
+                store.dialect(
+                    "INSERT OR REPLACE INTO reaction_roles(guild_id, message_id, emoji, role_id) "
+                    "VALUES (?, ?, ?, ?)",
+                    """
+                    INSERT INTO reaction_roles(guild_id, message_id, emoji, role_id)
+                    VALUES (?, ?, ?, ?)
+                    ON DUPLICATE KEY UPDATE role_id=VALUES(role_id)
+                    """,
+                ),
+                (target, message_id, emoji, role_id),
+            )
+        record_panel_event(
+            request, target, "Web panel reaction role saved",
+            f"Reaction role for `{emoji}` on message `{message_id}` was saved.",
+        )
+        return json_response({"ok": True}, 201)
+    with store.connect() as db:
+        rows = [dict(r) for r in db.execute(
+            "SELECT guild_id, message_id, emoji, role_id FROM reaction_roles WHERE guild_id=? "
+            "ORDER BY message_id, emoji",
+            (target,),
+        ).fetchall()]
+    return json_response({"roles": rows})
+
+
+async def reaction_role_delete(request: web.Request) -> web.Response:
+    target = guild_id(request)
+    payload = request.match_info
+    try:
+        message_id = int(payload["message_id"])
+        role_id = int(payload["role_id"])
+    except ValueError:
+        return json_response({"error": "Invalid IDs"}, 400)
+    emoji = payload["emoji"]
+    with store.connect() as db:
+        db.execute(
+            "DELETE FROM reaction_roles WHERE guild_id=? AND message_id=? AND emoji=? AND role_id=?",
+            (target, message_id, emoji, role_id),
+        )
+    return json_response({"ok": True})
+
+
+async def stickies_endpoint(request: web.Request) -> web.Response:
+    return json_response({"stickies": store.get_stickied(guild_id(request))})
+
+
+async def sticky_delete(request: web.Request) -> web.Response:
+    try:
+        channel_id = int(request.match_info["channel_id"])
+    except ValueError:
+        return json_response({"error": "Invalid channel ID"}, 400)
+    store.unstick(guild_id(request), channel_id)
+    return json_response({"ok": True})
+
+
+async def widget(request: web.Request) -> web.Response:
+    try:
+        target = int(request.match_info["guild_id"])
+    except ValueError:
+        return web.Response(text="Invalid server", status=400, content_type="text/plain")
+    data = store.dashboard_data(target)
+    leader = "".join(
+        f"<tr><td>{i+1}</td><td>{row['username']}</td><td>{row['level']}</td><td>{int(row['xp']):,}</td></tr>"
+        for i, row in enumerate(data["leaderboard"][:10])
+    ) or '<tr><td colspan="4">No activity yet.</td></tr>'
+    html = f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
+      <title>Server stats</title>
+      <style>
+        body{{margin:0;font:13px/1.5 system-ui,sans-serif;background:#0b0d12;color:#f4f6fb;padding:16px}}
+        h2{{margin:0 0 12px;font-size:16px}} .row{{display:flex;gap:16px;margin-bottom:12px}}
+        .metric{{flex:1;background:#12151d;border:1px solid #262c39;border-radius:10px;padding:12px}}
+        .metric b{{display:block;font-size:22px}} .metric span{{color:#949cad;font-size:11px}}
+        table{{border-collapse:collapse;width:100%}} th,td{{padding:6px 8px;text-align:left;border-bottom:1px solid #262c39}}
+        th{{color:#949cad;font-size:10px;text-transform:uppercase}}
+      </style></head><body>
+      <h2>Server stats</h2>
+      <div class="row">
+        <div class="metric"><span>Tracked members</span><b>{data['tracked_members']}</b></div>
+        <div class="metric"><span>Total XP</span><b>{int(data['total_xp']):,}</b></div>
+        <div class="metric"><span>Economy</span><b>{int(data['economy_total']):,}</b></div>
+        <div class="metric"><span>Active giveaways</span><b>{data['active_giveaways']}</b></div>
+      </div>
+      <table><thead><tr><th>#</th><th>Member</th><th>Level</th><th>XP</th></tr></thead><tbody>{leader}</tbody></table>
+      <p style="color:#949cad;font-size:11px;margin-top:12px">Powered by Response</p>
+      </body></html>"""
+    return web.Response(text=html, content_type="text/html", headers={
+        "Cache-Control": "no-store",
+        "Access-Control-Allow-Origin": "*",
+        "X-Response-Build": BUILD_ID,
+    })
+
+
+async def activity_series_endpoint(request: web.Request) -> web.Response:
+    try:
+        days = min(max(int(request.query.get("days", "14")), 1), 90)
+    except ValueError:
+        days = 14
+    return json_response({"series": store.activity_series(guild_id(request), days)})
+
+
 def create_app() -> web.Application:
     app = web.Application(
         middlewares=[access_log_middleware, auth_middleware],
@@ -786,6 +1084,22 @@ def create_app() -> web.Application:
     app.router.add_get("/api/guilds/{guild_id}/schedules", schedules)
     app.router.add_post("/api/guilds/{guild_id}/schedules", schedule_create)
     app.router.add_delete("/api/schedules/{schedule_id}", schedule_delete)
+    app.router.add_get("/api/guilds/{guild_id}/commands", custom_commands_endpoint)
+    app.router.add_post("/api/guilds/{guild_id}/commands", custom_commands_endpoint)
+    app.router.add_delete("/api/guilds/{guild_id}/commands/{trigger}", custom_command_delete)
+    app.router.add_get("/api/guilds/{guild_id}/shop", shop_endpoint)
+    app.router.add_post("/api/guilds/{guild_id}/shop", shop_endpoint)
+    app.router.add_delete("/api/guilds/{guild_id}/shop/{item_id}", shop_delete)
+    app.router.add_get("/api/guilds/{guild_id}/reaction-roles", reaction_roles_endpoint)
+    app.router.add_post("/api/guilds/{guild_id}/reaction-roles", reaction_roles_endpoint)
+    app.router.add_delete(
+        "/api/guilds/{guild_id}/reaction-roles/{message_id}/{emoji}/{role_id}",
+        reaction_role_delete,
+    )
+    app.router.add_get("/api/guilds/{guild_id}/activity", activity_series_endpoint)
+    app.router.add_get("/api/guilds/{guild_id}/stickies", stickies_endpoint)
+    app.router.add_delete("/api/guilds/{guild_id}/stickies/{channel_id}", sticky_delete)
+    app.router.add_get("/widget/{guild_id}", widget)
     return app
 
 

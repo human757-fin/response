@@ -44,6 +44,13 @@ class StoreTests(unittest.TestCase):
                 "reaction_roles",
                 "members",
                 "guilds",
+                "stickied_messages",
+                "custom_commands",
+                "starboard",
+                "reminders",
+                "shop_items",
+                "inventory",
+                "afk",
             ):
                 db.execute(f"DELETE FROM {table}")
 
@@ -258,6 +265,58 @@ class StoreTests(unittest.TestCase):
         self.assertIn("ENGINE=InnoDB", schema)
         self.assertIn("event_logs_guild", schema)
         self.assertNotIn("AUTOINCREMENT", schema)
+
+    def test_custom_commands_crud(self) -> None:
+        self.store.ensure_guild(1, "Test server")
+        self.assertTrue(self.store.set_custom_command(1, "Hello", "Hi there!"))
+        self.assertTrue(self.store.set_custom_command(1, "hello", "Updated"))
+        self.assertEqual(len(self.store.list_custom_commands(1)), 1)
+        self.assertEqual(self.store.get_custom_command(1, "Hello")["response"], "Updated")
+        self.assertTrue(self.store.delete_custom_command(1, "hello"))
+        self.assertIsNone(self.store.get_custom_command(1, "hello"))
+        self.assertFalse(self.store.delete_custom_command(1, "missing"))
+
+    def test_shop_inventory_and_purchase(self) -> None:
+        self.store.ensure_guild(1, "Test server")
+        self.store.add_shop_item(1, "Vip", "Special", 500, 1234567890123456789, 3)
+        items = self.store.list_shop_items(1)
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["price"], 500)
+        self.store.add_to_inventory(1, 20, items[0]["id"], 2)
+        inv = self.store.inventory_for(1, 20)
+        self.assertEqual(inv[0]["quantity"], 2)
+        self.assertTrue(self.store.consume_inventory(1, 20, items[0]["id"]))
+        self.assertEqual(self.store.inventory_for(1, 20)[0]["quantity"], 1)
+        self.assertTrue(self.store.delete_shop_item(1, items[0]["id"]))
+        self.assertEqual(self.store.list_shop_items(1), [])
+
+    def test_afk_round_trip(self) -> None:
+        self.store.set_afk(1, 20, "sleeping")
+        record = self.store.get_afk(1, 20)
+        self.assertEqual(record["reason"], "sleeping")
+        self.assertTrue(self.store.clear_afk(1, 20))
+        self.assertIsNone(self.store.get_afk(1, 20))
+
+    def test_reminders_crud(self) -> None:
+        self.store.add_reminder(20, 3, 1, "Drink water", 9999999999)
+        reminders = self.store.list_reminders(20)
+        self.assertEqual(len(reminders), 1)
+        self.assertTrue(self.store.delete_reminder(reminders[0]["id"], 20))
+        self.assertEqual(self.store.list_reminders(20), [])
+
+    def test_sticky_and_starboard(self) -> None:
+        self.store.set_stickied(1, 5, "Welcome text", None)
+        stickies = self.store.get_stickied(1)
+        self.assertEqual(len(stickies), 1)
+        self.assertEqual(stickies[0]["message_content"], "Welcome text")
+        self.store.unstick(1, 5)
+        self.assertEqual(self.store.get_stickied(1), [])
+        self.store.starboard_add_or_update(9, 1, 5, 3, 100)
+        row = self.store.starboard_row(9)
+        self.assertEqual(row["stars"], 3)
+        self.assertEqual(row["star_message_id"], 100)
+        self.store.starboard_remove(9)
+        self.assertIsNone(self.store.starboard_row(9))
 
 
 if __name__ == "__main__":
