@@ -286,7 +286,7 @@ async def discord_card(
     progress: float | None = None,
 ) -> discord.File:
     avatar, background = await asyncio.gather(
-        download_image(member.display_avatar.url),
+        download_image(member.display_avatar.replace(format="png").url),
         download_image(settings.get("background_image")),
     )
     image = await asyncio.to_thread(
@@ -2044,8 +2044,8 @@ class LeaderboardView(discord.ui.View):
             title="XP leaderboard",
             description=description,
             color=self.color,
-            footer=discord.EmbedFooter(text=f"Page {self.page+1} of {pages} · {total} members"),
         )
+        embed.set_footer(text=f"Page {self.page+1} of {pages} · {total} members")
         return embed
 
     @discord.ui.button(label="◀", style=discord.ButtonStyle.secondary, row=0)

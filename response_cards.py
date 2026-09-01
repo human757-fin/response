@@ -114,6 +114,10 @@ def render_card(
             )
 
     output = io.BytesIO()
+    background_layer = Image.new("RGB", canvas.size, (17, 18, 29))
+    canvas = Image.alpha_composite(
+        background_layer.convert("RGBA"), canvas if canvas.mode == "RGBA" else canvas.convert("RGBA")
+    )
     canvas.convert("RGB").save(output, "PNG", optimize=True)
     output.seek(0)
     return output
