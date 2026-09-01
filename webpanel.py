@@ -363,9 +363,9 @@ PAGE = r"""<!doctype html>
           <button class="primary">Create command</button></form>
         <div class="muted">Trigger with ${esc(cfg.prefix||"!")}prefix in Discord, e.g. ${esc(cfg.prefix||"!")}ping</div>
         ${d.commands.length?`<table><thead><tr><th>Trigger</th><th>Response</th><th>Enabled</th><th></th></tr></thead><tbody>
-        ${d.commands.map(c=>`<tr><td>${esc(cfg.prefix||"!")}${esc(c.trigger)}</td><td>${esc(c.response)}</td>
+        ${d.commands.map(c=>`<tr><td>${esc(cfg.prefix||"!")}${esc(c.command_name)}</td><td>${esc(c.response)}</td>
           <td>${c.enabled?'<span class="source-pill">on</span>':'<span class="source-pill">off</span>'}</td>
-          <td><button class="danger" data-cmd="${esc(c.trigger)}">Delete</button></td></tr>`).join("")}</tbody></table>`:
+          <td><button class="danger" data-cmd="${esc(c.command_name)}">Delete</button></td></tr>`).join("")}</tbody></table>`:
           '<div class="empty">No custom commands yet. Create one above.</div>'}</div>`;
       $("#cmdForm").addEventListener("submit",async e=>{e.preventDefault();const f=new FormData(e.target);
         try{await api(`/api/guilds/${state.guild.guild_id}/commands`,{method:"POST",body:JSON.stringify({name:f.get("name"),response:f.get("response")})});

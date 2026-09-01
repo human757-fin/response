@@ -459,10 +459,10 @@ MYSQL_SCHEMA = (
     CREATE TABLE IF NOT EXISTS custom_commands (
         id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
         guild_id BIGINT UNSIGNED NOT NULL,
-        trigger VARCHAR(100) NOT NULL,
+        command_name VARCHAR(100) NOT NULL,
         response TEXT NOT NULL,
         enabled TINYINT(1) NOT NULL DEFAULT 1,
-        UNIQUE KEY cc_guild_trigger (guild_id, trigger),
+        UNIQUE KEY cc_guild_command (guild_id, command_name),
         KEY cc_guild (guild_id)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
     """,
@@ -630,10 +630,10 @@ CREATE TABLE IF NOT EXISTS stickied_messages (
 CREATE TABLE IF NOT EXISTS custom_commands (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     guild_id INTEGER NOT NULL,
-    trigger TEXT NOT NULL,
+    command_name TEXT NOT NULL,
     response TEXT NOT NULL,
     enabled INTEGER NOT NULL DEFAULT 1,
-    UNIQUE(guild_id, trigger)
+    UNIQUE(guild_id, command_name)
 );
 CREATE TABLE IF NOT EXISTS starboard (
     source_message_id INTEGER NOT NULL PRIMARY KEY,
@@ -1220,7 +1220,7 @@ def unstick(guild_id: int, channel_id: int) -> None:
 def list_custom_commands(guild_id: int) -> list[dict[str, Any]]:
     with connect() as db:
         rows = db.execute(
-            "SELECT id, trigger, response, enabled FROM custom_commands WHERE guild_id=? ORDER BY trigger",
+            "SELECT id, command_name, response, enabled FROM custom_commands WHERE guild_id=? ORDER BY command_name",
             (guild_id,),
         ).fetchall()
     return [dict(row) for row in rows]
@@ -1229,7 +1229,7 @@ def list_custom_commands(guild_id: int) -> list[dict[str, Any]]:
 def get_custom_command(guild_id: int, trigger: str) -> dict[str, Any] | None:
     with connect() as db:
         row = db.execute(
-            "SELECT id, trigger, response, enabled FROM custom_commands WHERE guild_id=? AND trigger=?",
+            "SELECT id, command_name, response, enabled FROM custom_commands WHERE guild_id=? AND command_name=?",
             (guild_id, trigger.lower()),
         ).fetchone()
     return dict(row) if row else None
@@ -1242,12 +1242,12 @@ def set_custom_command(
         cursor = db.execute(
             dialect(
                 """
-                INSERT INTO custom_commands(guild_id, trigger, response, enabled) VALUES (?, ?, ?, ?)
-                ON CONFLICT(guild_id, trigger) DO UPDATE SET
+                INSERT INTO custom_commands(guild_id, command_name, response, enabled) VALUES (?, ?, ?, ?)
+                ON CONFLICT(guild_id, command_name) DO UPDATE SET
                     response=excluded.response, enabled=excluded.enabled
                 """,
                 """
-                INSERT INTO custom_commands(guild_id, trigger, response, enabled) VALUES (?, ?, ?, ?)
+                INSERT INTO custom_commands(guild_id, command_name, response, enabled) VALUES (?, ?, ?, ?)
                 ON DUPLICATE KEY UPDATE response=VALUES(response), enabled=VALUES(enabled)
                 """,
             ),
@@ -1259,7 +1259,7 @@ def set_custom_command(
 def delete_custom_command(guild_id: int, trigger: str) -> bool:
     with connect() as db:
         cursor = db.execute(
-            "DELETE FROM custom_commands WHERE guild_id=? AND trigger=?",
+            "DELETE FROM custom_commands WHERE guild_id=? AND command_name=?",
             (guild_id, trigger.lower()),
         )
         return bool(cursor.rowcount)

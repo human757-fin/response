@@ -2815,7 +2815,7 @@ async def custom_cmd_add(interaction: discord.Interaction, name: str, response: 
 async def custom_cmd_list(interaction: discord.Interaction) -> None:
     commands = store.list_custom_commands(interaction.guild_id)
     lines = "\n".join(
-        f"**!{row['trigger']}** — {row['response'][:80]}{'…' if len(row['response'])>80 else ''}"
+        f"**!{row['command_name']}** — {row['response'][:80]}{'…' if len(row['response'])>80 else ''}"
         for row in commands
     ) or "No custom commands yet."
     await interaction.response.send_message(
